@@ -4,7 +4,9 @@
     "width": 1280,
     "height": 720,
     "hfov_deg": 70.0,
-    "intrinsics_file": "calib/intrinsics.json"
+    "intrinsics_file": "calib/intrinsics.json",
+    "_latency_note": "Exposure -> frame-delivered delay. A frame's capture time = read time - latency_s. Fine-tune by eye with [ / ] in Unity's Mirror mode.",
+    "latency_s": 0.04
   },
   "screen": {
     "_note": "Active display area of the 14in MacBook Pro (3024x1964 @ 254 ppi). Mirror-frame origin = lower-left corner.",
@@ -24,10 +26,24 @@
     "fusion_weight": 0.7,
     "torso_surface_offset_m": 0.10
   },
+  "compute": {
+    "_note": "OpenVINO CPU thread budgets; 0 = auto (depth gets half the cores, pose + hands the rest). Depth is capped because the distance it feeds is smoothed at < 1 Hz.",
+    "pose_threads": 0,
+    "depth_threads": 0,
+    "depth_max_hz": 12.0
+  },
   "filters": {
-    "joints": {"mincutoff": 1.2, "beta": 0.8},
-    "eye": {"mincutoff": 1.0, "beta": 0.5},
+    "_note": "PosePredictor: One-Euro at rest, constant-velocity Kalman (accel_std, m/s^2) once the smoothed speed passes gate_speed (m/s). meas_std = landmark noise per Mirror axis (m).",
+    "joints": {"mincutoff": 1.2, "beta": 0.8, "accel_std": 25.0, "gate_accel_std": 2.0, "gate_speed": [0.1, 0.35], "meas_std": [0.004, 0.004, 0.02]},
+    "eye": {"mincutoff": 1.0, "beta": 0.5, "accel_std": 25.0, "gate_accel_std": 2.0, "gate_speed": [0.1, 0.35], "meas_std": [0.004, 0.004, 0.02]},
     "scale_ema": 0.05
+  },
+  "predict": {
+    "_note": "Sent to Unity, which extrapolates the pose to each rendered frame's display time: x + v*tau*(1-exp(-h/tau)), h <= max_horizon_s. blend_tc_s eases the hand-over when a new perception frame arrives.",
+    "display_latency_s": 0.025,
+    "horizon_tau_s": 0.35,
+    "max_horizon_s": 0.25,
+    "blend_tc_s": 0.015
   },
   "gestures": {
     "_note": "swipe distances are in shoulder widths (sw) in the 2D image, so they don't depend on distance",

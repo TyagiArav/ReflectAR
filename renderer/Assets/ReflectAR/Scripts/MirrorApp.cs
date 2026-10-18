@@ -21,6 +21,10 @@ namespace ReflectAR
         public bool showProxy;
         public bool showDebug = true;
         public bool cubeTest;
+        [Tooltip("Extrapolate the pose to when each frame reaches the screen (P toggles, for A/B).")]
+        public bool predict = true;
+        [Tooltip("Extra prediction lead (ms) on top of config.json's latencies, Mirror mode. Tune with [ and ].")]
+        public float leadMs;
 
         TrackingClient client;
         Camera cam;
@@ -111,6 +115,9 @@ namespace ReflectAR
                 if (kb.bKey.wasPressedThisFrame) showProxy = !showProxy;
                 if (kb.dKey.wasPressedThisFrame) showDebug = !showDebug;
                 if (kb.cKey.wasPressedThisFrame) cubeTest = !cubeTest;
+                if (kb.pKey.wasPressedThisFrame) { predict = !predict; ui.Toast(predict ? "Prediction on" : "Prediction off"); }
+                if (kb.leftBracketKey.wasPressedThisFrame) leadMs -= 5f;
+                if (kb.rightBracketKey.wasPressedThisFrame) leadMs += 5f;
                 if (kb.escapeKey.wasPressedThisFrame) Application.Quit();
             }
             while (client.Events.TryDequeue(out var e))
@@ -139,12 +146,19 @@ namespace ReflectAR
         // ------------------------------------------------------------------ frame
         void Update()
         {
+            client.Poll();
             HandleInput();
             var f = client.Latest;
             bool fresh = client.Connected && f != null && Time.time - client.LastFrameTime < 0.5f;
             bool tracked = fresh && f.tracked;
             if (tracked)
             {
+                // Mirror: the real reflection has no delay, so aim for the moment this frame is on
+                // screen. CameraFeed: match the (equally delayed) image under the overlay instead.
+                double now = TrackingClient.Now;
+                bool matchFeed = mode == ViewMode.CameraFeed && now - client.FeedCaptureTime < 0.5;
+                double target = matchFeed ? client.FeedCaptureTime : now + client.DisplayLatency + leadMs * 0.001;
+                client.Predict(target, predict, predict && !matchFeed);
                 body.Update(client.Joints, client.Visibility, Time.deltaTime, !hadBody || Time.time - lastTracked > 0.5f);
                 hadBody = true;
                 lastTracked = Time.time;
@@ -168,7 +182,8 @@ namespace ReflectAR
             cube.SetActive(cubeTest && mode == ViewMode.Mirror);
             if (cube.activeSelf && f != null && f.screen != null)
                 cube.transform.SetPositionAndRotation(new Vector3(f.screen.w_m / 2, f.screen.h_m / 2, 0.75f), Quaternion.Euler(20, 30, 0));
-            ui.Update(f, client.Connected, tracked, current, selected, mode, showDebug, cam, body);
+            string lat = $"latency {client.LatencyMs:0} ms  ·  prediction {(predict ? $"+{client.HorizonMs:0} ms" : "off")}  lead {leadMs:+0;-0} ms  [P] [ [ ] ]";
+            ui.Update(f, client.Connected, tracked, current, selected, mode, showDebug, cam, body, lat);
         }
 
         void LateUpdate()

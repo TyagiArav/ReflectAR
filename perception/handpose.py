@@ -17,8 +17,8 @@ POSE_HAND = {"left": (15, 17, 19), "right": (16, 18, 20)}
 
 
 class HandPose:
-    def __init__(self, core: ov.Core, model_dir="models", device="CPU"):
-        self.model = core.compile_model(f"{model_dir}/hand_landmark_full.tflite", device)
+    def __init__(self, core: ov.Core, model_dir="models", device="CPU", config=None):
+        self.model = core.compile_model(f"{model_dir}/hand_landmark_full.tflite", device, config or {})
         self.req = self.model.create_infer_request()
 
     @staticmethod

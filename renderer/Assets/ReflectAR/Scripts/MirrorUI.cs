@@ -87,7 +87,7 @@ namespace ReflectAR
 
             toast = Label(canvasRt, "", 54, FontStyle.Bold, new Vector2(0, 120), new Vector2(1200, 80));
             toast.color = Accent;
-            debug = Label(canvasRt, "", 20, FontStyle.Normal, Vector2.zero, new Vector2(1100, 30));
+            debug = Label(canvasRt, "", 20, FontStyle.Normal, Vector2.zero, new Vector2(1100, 60));
             debug.alignment = TextAnchor.UpperLeft;
             var drt = debug.rectTransform; drt.anchorMin = drt.anchorMax = drt.pivot = new Vector2(0, 1); drt.anchoredPosition = new Vector2(16, -12);
         }
@@ -97,7 +97,7 @@ namespace ReflectAR
         public void Toast(string s) { toast.text = s; toastT = Time.time; }
 
         public void Update(TrackingFrame f, bool connected, bool tracked, int current, int selected,
-                           ViewMode mode, bool showDebug, Camera cam, BodyRig body)
+                           ViewMode mode, bool showDebug, Camera cam, BodyRig body, string latency)
         {
             // ---- prompt
             string p = null, sub = null;
@@ -147,7 +147,7 @@ namespace ReflectAR
             if (showDebug)
                 debug.text = f == null
                     ? $"{(connected ? "connected" : "no perception")}  ·  [M] mode  [←/→] browse  [Space] select  [B] proxy  [C] cube  [D] debug"
-                    : $"{mode}  ·  perception {f.proc_fps:0} fps  depth {f.depth_hz:0} Hz  ·  dist {f.dist:0.00} m (skel {f.z_skel:0.00} / mono {f.z_da:0.00}, s={f.scale:0.00})  ·  render {1f / Mathf.Max(Time.smoothDeltaTime, 1e-3f):0} fps  ·  [M] mode [B] proxy [C] cube [D] debug";
+                    : $"{mode}  ·  perception {f.proc_fps:0} fps  depth {f.depth_hz:0} Hz  ·  dist {f.dist:0.00} m (skel {f.z_skel:0.00} / mono {f.z_da:0.00}, s={f.scale:0.00})  ·  render {1f / Mathf.Max(Time.smoothDeltaTime, 1e-3f):0} fps  ·  [M] mode [B] proxy [C] cube [D] debug\n{latency}";
         }
 
         // ------------------------------------------------------------------ helpers

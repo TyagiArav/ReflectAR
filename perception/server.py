@@ -4,9 +4,13 @@ Webcam -> BlazePose (OpenVINO) + metric mono depth -> 3D joints/eye in the
 Mirror frame -> gestures + range check -> TCP stream to Unity.
 
 Wire format (TCP, Python is the server, Unity connects):
-    1 byte type ('J' = JSON tracking frame, 'I' = JPEG camera image)
+    1 byte type ('J' = JSON tracking frame, 'I' = camera image)
     4 byte big-endian payload length
-    payload
+    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG
+
+Latency: each 'J' frame carries joint positions *and velocities* at the frame's capture time
+'t' plus its send time 't_send'; Unity extrapolates them to the moment each rendered frame
+reaches the screen (see filters.PosePredictor, TrackingClient.Predict).
 
 Run:  .venv/bin/python server.py [--snapshot debug.jpg] [--no-image]
 """
@@ -18,7 +22,7 @@ import openvino as ov
 from blazepose import BlazePose
 from handpose import HandPose, is_fist
 from depth import MonoDepth
-from filters import OneEuro
+from filters import OneEuro, PosePredictor
 from geometry import Intrinsics, skeleton_distance, CameraToMirror
 from gestures import Gestures, SIDES
 
@@ -64,9 +68,14 @@ class Camera:
 
 
 class Streamer:
-    """Single-client TCP server. Keeps only the newest image; JSON events are merged."""
+    """Single-client TCP server. Keeps only the newest image; JSON events are merged.
 
-    def __init__(self, host, port):
+    Tracking JSON goes out first; the image is JPEG-encoded afterwards on this thread, so
+    neither the encode nor the larger write delays the pose.
+    """
+
+    def __init__(self, host, port, jpeg_width=960, jpeg_quality=75):
+        self.jpeg_w, self.jpeg_q = jpeg_width, jpeg_quality
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind((host, port))
@@ -74,7 +83,7 @@ class Streamer:
         self.conn = None
         self.lock = threading.Condition()
         self.json_msg = None
-        self.jpeg = None
+        self.image = None                            # (capture time, BGR frame or JPEG bytes)
         threading.Thread(target=self._accept, daemon=True).start()
         threading.Thread(target=self._send, daemon=True).start()
         print(f"[net] listening on {host}:{port}")
@@ -93,33 +102,82 @@ class Streamer:
                     self.conn.close()
                 self.conn = c
 
-    def push(self, msg, jpeg=None):
+    def push(self, msg, image=None):
         with self.lock:
             if self.conn is None:
                 msg["events"] = []                   # nobody to act on them: don't replay later
             elif self.json_msg is not None:          # unsent: keep its events
                 msg["events"] = self.json_msg["events"] + msg["events"]
             self.json_msg = msg
-            if jpeg is not None:
-                self.jpeg = jpeg
+            if image is not None:
+                self.image = image
             self.lock.notify()
 
     def _send(self):
         while True:
             with self.lock:
                 self.lock.wait_for(lambda: self.json_msg is not None and self.conn is not None)
-                msg, jpg, conn = self.json_msg, self.jpeg, self.conn
-                self.json_msg, self.jpeg = None, None
+                msg, img, conn = self.json_msg, self.image, self.conn
+                self.json_msg, self.image = None, None
             try:
-                if jpg is not None:
-                    conn.sendall(b"I" + struct.pack(">I", len(jpg)) + jpg)
+                msg["t_send"] = time.time()
                 body = json.dumps(msg, separators=(",", ":")).encode()
                 conn.sendall(b"J" + struct.pack(">I", len(body)) + body)
+                if img is not None:
+                    t_img, jpg = img
+                    if not isinstance(jpg, bytes):
+                        h, w = jpg.shape[:2]
+                        small = cv2.resize(jpg, (self.jpeg_w, int(h * self.jpeg_w / w)), interpolation=cv2.INTER_AREA)
+                        jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_q])[1].tobytes()
+                    conn.sendall(b"I" + struct.pack(">Id", len(jpg) + 8, t_img) + jpg)
             except OSError:
                 print("[net] renderer disconnected")
                 with self.lock:
                     if self.conn is conn:
                         self.conn = None
+
+
+class HandWorker:
+    """Fist classifier off the critical path. Only the 5 s select-hold uses it, so the main
+    loop takes the newest result (one frame old) instead of waiting ~5 ms per raised hand."""
+
+    def __init__(self, hands):
+        self.hands = hands
+        self.cond = threading.Condition()
+        self.job = None
+        self.fists, self.ms = {}, 0.0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, bgr, rois):
+        """rois: {side: roi} for the raised hands; returns the newest fist state for those sides."""
+        with self.cond:
+            if rois:
+                self.job = (bgr, rois)
+                self.cond.notify()
+            else:
+                self.job, self.fists = None, {}
+            return {s: v for s, v in self.fists.items() if s in rois}
+
+    def _loop(self):
+        while True:
+            with self.cond:
+                self.cond.wait_for(lambda: self.job is not None)
+                (bgr, rois), self.job = self.job, None
+            t0 = time.perf_counter()
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            fists = {side: is_fist(self.hands(rgb, roi)) for side, roi in rois.items()}
+            with self.cond:
+                self.fists = fists
+            self.ms = 0.9 * self.ms + 0.1 * (time.perf_counter() - t0) * 1000
+
+
+def cpu_config(core, threads):
+    """OpenVINO CPU settings for one model group. Pose and depth each get their own thread
+    budget with pinning off: with shared defaults, depth inference makes pose inference
+    ~4x slower (8 -> 35 ms on a 4-core test box); split like this it stays at ~10-14 ms."""
+    supported = core.get_property("CPU", "SUPPORTED_PROPERTIES")
+    cfg = {"PERFORMANCE_HINT": "LATENCY", "INFERENCE_NUM_THREADS": int(threads), "ENABLE_CPU_PINNING": False}
+    return {k: v for k, v in cfg.items() if k in supported}
 
 
 # ------------------------------------------------------------------ calibration
@@ -200,20 +258,29 @@ def main():
 
     core = ov.Core()
     core.set_property("CPU", {"CACHE_DIR": "models/cache"})
-    pose = BlazePose(core)
-    hands = HandPose(core)
-    depth = MonoDepth(core)
+    comp = cfg.get("compute", {})
+    ncpu = os.cpu_count() or 4
+    depth_thr = comp.get("depth_threads") or max(1, ncpu // 2)
+    pose_thr = comp.get("pose_threads") or max(1, ncpu - depth_thr)
+    pose_cfg, depth_cfg = cpu_config(core, pose_thr), cpu_config(core, depth_thr)
+    pose = BlazePose(core, config=pose_cfg)
+    hands = HandWorker(HandPose(core, config=pose_cfg))
+    depth = MonoDepth(core, config=depth_cfg, max_hz=comp.get("depth_max_hz", 12.0))
+    print(f"[ov] {ncpu} CPUs: pose/hands {pose_thr} threads, depth {depth_thr} threads "
+          f"(capped at {comp.get('depth_max_hz', 12.0)} Hz)")
     cc = cfg["camera"]
     cam = Camera(cc["index"], cc["width"], cc["height"], args.video)
     frame, _, seq = cam.read(0)
     H, W = frame.shape[:2]
     K = Intrinsics.load(cc, W, H)
     to_mirror = CameraToMirror(cfg["camera_pose"])
-    net = Streamer(cfg["net"]["host"], cfg["net"]["port"])
+    net = Streamer(cfg["net"]["host"], cfg["net"]["port"], cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"])
     gest = Gestures(cfg["gestures"])
     rng = RangeCheck(*cfg["range_m"])
     fj, fe = cfg["filters"]["joints"], cfg["filters"]["eye"]
-    f_joints, f_eye, f_dist = OneEuro(**fj), OneEuro(**fe), OneEuro(0.5, 0.3)
+    f_joints, f_eye, f_dist = PosePredictor(**fj), PosePredictor(**fe), OneEuro(0.5, 0.3)
+    pred_cfg = cfg.get("predict", {})
+    cam_lat = cc.get("latency_s", 0.0)               # exposure -> frame delivered to us
     wfuse = cfg["depth"]["fusion_weight"]
     cal = load_depth_calib()
     calib = DistanceCalibrator(args.calib_dist, cal) if args.calib_dist else None
@@ -221,18 +288,20 @@ def main():
     print(f"[cam] {W}x{H}  fx={K.fx:.0f} ({src})  depth calib: skel={cal['skel']} da={cal['da']} "
           f"from {[p['d'] for p in cal['points']]} m")
 
-    jpeg_w, jpeg_q = cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"]
-    fps, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, ""
+    fps, pose_ms, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, 0.0, ""
+    last_da = (None, -1e9)
     while True:
         frame, stamp, seq = cam.read(seq)
         t0 = time.time()
+        t_cap = stamp - cam_lat
         depth.submit(frame)
         res = pose(frame)
-        msg = {"t": stamp, "seq": seq, "tracked": False, "range": "none", "dist": 0.0,
+        pose_ms = 0.9 * pose_ms + 0.1 * (time.time() - t0) * 1000
+        msg = {"t": t_cap, "seq": seq, "tracked": False, "range": "none", "dist": 0.0,
                "events": [], "fist_progress": 0.0, "fist_hand": "",
                "cam": {**K.as_dict(), "pos": cfg["camera_pose"]["pos_m"],
                        "tilt": cfg["camera_pose"].get("tilt_down_deg", 0.0)},
-               "screen": cfg["screen"]}
+               "screen": cfg["screen"], "predict": pred_cfg}
         fists = {}
         cue = skeleton_distance(res["uv"], res["world"], res["vis"], K) if res else None
         if cue is not None:
@@ -246,6 +315,10 @@ def main():
             samples = [s for s in samples if s]
             z_da_raw = float(np.median(samples)) + cfg["depth"]["torso_surface_offset_m"] if samples else None
             z_da = cal["da"][0] * z_da_raw + cal["da"][1] if z_da_raw else None
+            if z_da:
+                last_da = (z_da, stamp)
+            elif stamp - last_da[1] < 0.5:            # brief dropout (stale map during fast motion,
+                z_da = last_da[0]                     # torso samples hit background): hold, don't switch cue
             if z_skel is None:
                 if not z_da:
                     z_skel = max(z_skel_raw, 0.3)
@@ -264,23 +337,25 @@ def main():
             #     so the 3D skeleton always lands exactly on the person in the image
             Z = np.maximum(z_root + (world[:, 2] - world[list(TORSO), 2].mean()), 0.2)
             P_c = np.stack([(uv[:, 0] - K.cx) * Z / K.fx, (uv[:, 1] - K.cy) * Z / K.fy, Z], axis=1)
-            P_m = f_joints(to_mirror(P_c), stamp)
-            eye = f_eye(to_mirror((P_c[L_EYE] + P_c[R_EYE]) / 2), stamp)
+            P_m, V_m = f_joints(to_mirror(P_c), stamp, vis)
+            eye, eye_v = f_eye(to_mirror((P_c[L_EYE] + P_c[R_EYE]) / 2), stamp)
             dist = z_root
             z_skel_log, z_da_log, scale = z_skel, z_da, z_fused / max(z_skel, 1e-3)
 
-            # --- hands for the fist gesture (only for raised hands)
-            rgb = None
+            # --- hands for the fist gesture (only for raised hands), async: result is 1 frame old
+            rois = {}
             for side, (wi, si) in SIDES.items():
                 if vis[wi] > 0.5 and P_m[wi, 1] > P_m[si, 1] - 0.05:
                     roi = HandPose.roi_from_pose(uv, side)
                     if roi is not None:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if rgb is None else rgb
-                        fists[side] = is_fist(hands(rgb, roi))
+                        rois[side] = roi
+            fists = hands.submit(frame, rois)
             msg.update(tracked=True, range=rng(dist), dist=dist,
                        joints=np.round(P_m, 4).ravel().tolist(),
+                       vel=np.round(V_m, 3).ravel().tolist(),
                        vis=np.round(vis, 3).tolist(),
                        eye=np.round(eye, 4).tolist(),
+                       eye_vel=np.round(eye_v, 3).tolist(),
                        uv=np.round(uv, 1).ravel().tolist(),
                        z_skel=round(z_skel_log, 3), z_da=round(z_da_log or 0.0, 3), scale=round(scale, 3))
             if rng.state == "ok":
@@ -296,14 +371,11 @@ def main():
             if stamp - last_seen > 1.0:
                 f_joints.reset(); f_eye.reset(); f_dist.reset()
 
-        jpg = None
-        if not args.no_image:
-            small = cv2.resize(frame, (jpeg_w, int(H * jpeg_w / W)), interpolation=cv2.INTER_AREA)
-            jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])[1].tobytes()
         dt = time.time() - t0
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
-        net.push(msg, jpg)
+        msg["proc_ms"] = round(dt * 1000, 1)
+        net.push(msg, None if args.no_image else (t_cap, frame))
 
         if msg["events"]:
             print(f"[gesture] {msg['events']}   {gest.debug}")
@@ -314,7 +386,8 @@ def main():
             t_log = stamp
             print(f"[state] tracked={msg['tracked']} range={msg['range']} dist={msg['dist']:.2f} "
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "
-                  f"fists={fists} prog={msg['fist_progress']} proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
+                  f"fists={fists} prog={msg['fist_progress']} pose={pose_ms:.1f}ms hands={hands.ms:.1f}ms "
+                  f"proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
                   f"net={'up' if net.connected else 'down'}")
         if args.snapshot and stamp - t_snap > 1.0:
             t_snap = stamp

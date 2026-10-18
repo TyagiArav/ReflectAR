@@ -50,12 +50,14 @@ namespace ReflectAR
         public Quaternion ChestRot => Quaternion.LookRotation(Fwd, Up);
         public Quaternion PelvisRot => Quaternion.LookRotation(PFwd, Up);
 
-        public float smoothing = 30f;               // 1/s, extra interpolation between 30 Hz frames
+        /// <summary>1/s; 0 = follow the target exactly. TrackingClient already filters and predicts
+        /// the pose every render frame, and any smoothing here would add lag back (30/s ~ 33 ms).</summary>
+        public float smoothing = 0f;
         bool measured;
 
         public void Update(Vector3[] target, float[] vis, float dt, bool snap)
         {
-            float a = snap ? 1f : 1f - Mathf.Exp(-smoothing * dt);
+            float a = snap || smoothing <= 0f ? 1f : 1f - Mathf.Exp(-smoothing * dt);
             for (int i = 0; i < 33; i++)
             {
                 J[i] = Vector3.Lerp(J[i], target[i], a);

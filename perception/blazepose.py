@@ -51,9 +51,9 @@ def roi_from_points(p_center, p_top, scale=1.25):
 
 
 class BlazePose:
-    def __init__(self, core: ov.Core, model_dir="models", device="CPU"):
-        self.det = core.compile_model(f"{model_dir}/pose_detection.tflite", device)
-        self.lm = core.compile_model(f"{model_dir}/pose_landmark_full.tflite", device)
+    def __init__(self, core: ov.Core, model_dir="models", device="CPU", config=None):
+        self.det = core.compile_model(f"{model_dir}/pose_detection.tflite", device, config or {})
+        self.lm = core.compile_model(f"{model_dir}/pose_landmark_full.tflite", device, config or {})
         self.det_req = self.det.create_infer_request()
         self.lm_req = self.lm.create_infer_request()
         self.anchors = _gen_anchors()
