@@ -1,0 +1,11 @@
+# Python 3.11+.  python -m venv .venv  then  .venv/bin/pip install -r requirements.txt
+# (Windows: .venv\Scripts\pip install -r requirements.txt)
+numpy
+opencv-python
+openvino>=2024.4                                       # CPU inference (and the "openvino" backend)
+# macOS 14+ (Apple Silicon): Core ML -> Neural Engine / GPU
+onnxruntime>=1.20 ; sys_platform == "darwin"
+# Windows / Linux with an NVIDIA GPU: CUDA + cuDNN come as pip wheels (needs NVIDIA driver 580+).
+# Optional: install TensorRT 10 for the fastest path (first run builds engines, cached after).
+# Windows without NVIDIA: replace this line with  onnxruntime-directml  (any DirectX 12 GPU).
+onnxruntime-gpu[cuda,cudnn]>=1.21 ; sys_platform != "darwin"

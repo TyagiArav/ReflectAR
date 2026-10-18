@@ -1,4 +1,4 @@
-"""Metric monocular depth (Depth Anything V2 Metric-Indoor-Small, OpenVINO IR).
+"""Metric monocular depth (Depth Anything V2 Metric-Indoor-Small; OpenVINO IR or ONNX, see backend.py).
 
 Runs on its own thread, capped at `max_hz` so it doesn't starve pose inference of CPU
 (the distance it feeds is smoothed at < 1 Hz anyway); the main loop always reads the
@@ -8,7 +8,6 @@ depth camera' half of the depth estimate; see fusion in server.py.
 import threading, time
 import numpy as np
 import cv2
-import openvino as ov
 
 IN_W, IN_H = 476, 266                      # multiples of 14 (ViT patch)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
@@ -16,9 +15,8 @@ STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
 class MonoDepth:
-    def __init__(self, core: ov.Core, path="models/da2_metric_indoor_small.xml", device="CPU",
-                 config=None, max_hz=12.0):
-        self.model = core.compile_model(path, device, {"PERFORMANCE_HINT": "LATENCY", **(config or {})})
+    def __init__(self, backend, max_hz=12.0):
+        self.model = backend.load("depth", "depth")
         self.min_period = 1.0 / max_hz if max_hz > 0 else 0.0
         self._frame = None
         self._lock = threading.Lock()
@@ -33,7 +31,6 @@ class MonoDepth:
             self._frame = bgr
 
     def _loop(self):
-        req = self.model.create_infer_request()
         while self._run:
             with self._lock:
                 f, self._frame = self._frame, None
@@ -48,7 +45,7 @@ class MonoDepth:
             rgb = cv2.cvtColor(cv2.resize(f, (IN_W, IN_H), interpolation=cv2.INTER_AREA),
                                cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             x = ((rgb - MEAN) / STD).transpose(2, 0, 1)[None]
-            self.depth = req.infer({0: x})[self.model.output(0)][0]
+            self.depth = self.model(np.ascontiguousarray(x))[0][0]
             t1 = time.time()
             self.hz = 0.9 * self.hz + 0.1 / max(t1 - self.stamp, 1e-3)    # achieved update rate
             self.stamp = t1
