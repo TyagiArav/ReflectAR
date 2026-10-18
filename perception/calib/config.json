@@ -66,5 +66,6 @@
     "fist_gap_tolerance_s": 0.5,
     "fist_max_drift_m": 0.15
   },
-  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75}
+  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75,
+          "_mask_note": "person-mask width sent to Unity for occlusion (0 = off)", "mask_width": 256}
 }

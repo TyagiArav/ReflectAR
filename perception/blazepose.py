@@ -120,3 +120,15 @@ class BlazePose:
             "uv": uv[:33], "z_px": z[:33], "vis": np.minimum(vis, pres)[:33],
             "world": world[:33], "score": flag, "seg": seg, "seg_affine": M,
         }
+
+
+def frame_mask(res, img_w, img_h, out_w):
+    """Person segmentation in full-frame coordinates, (out_h, out_w) uint8, 255 = person.
+
+    The landmark model segments its 256x256 crop; seg_affine maps crop pixels to image
+    pixels, so a scaled copy of it warps the mask into a small frame-aligned image."""
+    out_h = int(round(img_h * out_w / img_w))
+    M = res["seg_affine"] * (out_w / img_w)             # crop -> image -> mask pixels
+    m = cv2.warpAffine(res["seg"].astype(np.float32), M, (out_w, out_h), flags=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return (np.clip(m, 0, 1) * 255).astype(np.uint8)

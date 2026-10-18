@@ -80,6 +80,9 @@ namespace ReflectAR
         public float HorizonMs { get; private set; }
         /// <summary>Capture time of the camera image now in <see cref="Feed"/>, local clock.</summary>
         public double FeedCaptureTime { get; private set; } = double.NegativeInfinity;
+        /// <summary>Person segmentation in camera-image coordinates (R8, v = 0 at the image top).</summary>
+        public Texture2D Mask { get; private set; }
+        public double MaskCaptureTime { get; private set; } = double.NegativeInfinity;
 
         /// <summary>Monotonic local clock (s), usable from any thread.</summary>
         public static double Now => Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
@@ -88,8 +91,9 @@ namespace ReflectAR
         Thread thread;
         readonly object gate = new object();
         TrackingFrame pendingFrame;
-        byte[] pendingJpeg;
-        double pendingJpegT;
+        byte[] pendingJpeg, pendingMask;
+        double pendingJpegT, pendingMaskT;
+        int pendingMaskW, pendingMaskH;
 
         // perception clock -> local clock: offset = min over recent frames of (arrival - t_send)
         readonly double[] offsets = new double[64];
@@ -156,6 +160,18 @@ namespace ReflectAR
                                 Buffer.BlockCopy(body, 8, jpg, 0, len - 8);
                                 lock (gate) { pendingJpeg = jpg; pendingJpegT = BitConverter.ToDouble(tb, 0); }
                             }
+                            else if (header[0] == (byte)'M' && len > 12)
+                            {
+                                // capture time (float64), width, height (uint16), then uint8 rows, top first
+                                var tb = new byte[8];
+                                Buffer.BlockCopy(body, 0, tb, 0, 8);
+                                if (BitConverter.IsLittleEndian) Array.Reverse(tb);
+                                int w = (body[8] << 8) | body[9], h = (body[10] << 8) | body[11];
+                                if (w * h != len - 12) continue;
+                                var m = new byte[w * h];
+                                Buffer.BlockCopy(body, 12, m, 0, w * h);
+                                lock (gate) { pendingMask = m; pendingMaskT = BitConverter.ToDouble(tb, 0); pendingMaskW = w; pendingMaskH = h; }
+                            }
                         }
                     }
                 }
@@ -182,13 +198,16 @@ namespace ReflectAR
         public void Poll()
         {
             TrackingFrame f;
-            byte[] jpg;
-            double jpgT;
+            byte[] jpg, mask;
+            double jpgT, maskT;
+            int maskW, maskH;
             lock (gate)
             {
                 f = pendingFrame; pendingFrame = null;
                 jpg = pendingJpeg; pendingJpeg = null;
                 jpgT = pendingJpegT;
+                mask = pendingMask; pendingMask = null;
+                maskT = pendingMaskT; maskW = pendingMaskW; maskH = pendingMaskH;
             }
             if (f != null)
             {
@@ -209,6 +228,15 @@ namespace ReflectAR
             {
                 Feed.LoadImage(jpg, false);
                 FeedCaptureTime = jpgT + clockOffset;
+            }
+            if (mask != null && offsetCount > 0)
+            {
+                if (Mask == null || Mask.width != maskW || Mask.height != maskH)
+                    Mask = new Texture2D(maskW, maskH, TextureFormat.R8, false)
+                        { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear };
+                Mask.LoadRawTextureData(mask);
+                Mask.Apply(false);
+                MaskCaptureTime = maskT + clockOffset;
             }
         }
 
@@ -275,6 +303,15 @@ namespace ReflectAR
             for (int i = 0; i < 33; i++)
                 Joints[i] = blend ? Eval(basePos[i], baseVel[i], corr[i], target, now) : Extrapolate(basePos[i], baseVel[i], Horizon(target));
             Eye = blend ? Eval(eyePos, eyeVel, eyeCorr, target, now) : Extrapolate(eyePos, eyeVel, Horizon(target));
+        }
+
+        /// <summary>The pose at local time <paramref name="t"/> without the hand-over easing, e.g. at the
+        /// mask's capture time, to see how far each joint has moved since then.</summary>
+        public void PoseAt(double t, Vector3[] joints)
+        {
+            if (!hasState) return;
+            float h = Horizon(t);
+            for (int i = 0; i < 33; i++) joints[i] = Extrapolate(basePos[i], baseVel[i], h);
         }
 
         public float DisplayLatency => tuning.display_latency_s;

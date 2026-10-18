@@ -6,7 +6,9 @@ Mirror frame -> gestures + range check -> TCP stream to Unity.
 Wire format (TCP, Python is the server, Unity connects):
     1 byte type ('J' = JSON tracking frame, 'I' = camera image)
     4 byte big-endian payload length
-    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG
+    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG;
+             'M' = float64 capture time + uint16 width + uint16 height + person mask
+                   (uint8, rows top first, 255 = person) used to trim the occlusion proxy
 
 Latency: each 'J' frame carries joint positions *and velocities* at the frame's capture time
 't' plus its send time 't_send'; Unity extrapolates them to the moment each rendered frame
@@ -21,7 +23,7 @@ import numpy as np
 import cv2
 
 from backend import Backend, warmup
-from blazepose import BlazePose, DET_SIZE, LM_SIZE
+from blazepose import BlazePose, DET_SIZE, LM_SIZE, frame_mask
 from handpose import HandPose, HAND_SIZE, is_fist
 from depth import MonoDepth, IN_H, IN_W
 from filters import OneEuro, PosePredictor
@@ -92,6 +94,7 @@ class Streamer:
         self.lock = threading.Condition()
         self.json_msg = None
         self.image = None                            # (capture time, BGR frame or JPEG bytes)
+        self.mask = None                             # (capture time, uint8 mask)
         threading.Thread(target=self._accept, daemon=True).start()
         threading.Thread(target=self._send, daemon=True).start()
         print(f"[net] listening on {host}:{port}")
@@ -110,7 +113,7 @@ class Streamer:
                     self.conn.close()
                 self.conn = c
 
-    def push(self, msg, image=None):
+    def push(self, msg, image=None, mask=None):
         with self.lock:
             if self.conn is None:
                 msg["events"] = []                   # nobody to act on them: don't replay later
@@ -119,18 +122,23 @@ class Streamer:
             self.json_msg = msg
             if image is not None:
                 self.image = image
+            if mask is not None:
+                self.mask = mask
             self.lock.notify()
 
     def _send(self):
         while True:
             with self.lock:
                 self.lock.wait_for(lambda: self.json_msg is not None and self.conn is not None)
-                msg, img, conn = self.json_msg, self.image, self.conn
-                self.json_msg, self.image = None, None
+                msg, img, mask, conn = self.json_msg, self.image, self.mask, self.conn
+                self.json_msg, self.image, self.mask = None, None, None
             try:
                 msg["t_send"] = time.time()
                 body = json.dumps(msg, separators=(",", ":")).encode()
                 conn.sendall(b"J" + struct.pack(">I", len(body)) + body)
+                if mask is not None:
+                    t_m, m = mask
+                    conn.sendall(b"M" + struct.pack(">IdHH", m.size + 12, t_m, m.shape[1], m.shape[0]) + m.tobytes())
                 if img is not None:
                     t_img, jpg = img
                     if not isinstance(jpg, bytes):
@@ -378,7 +386,9 @@ def main():
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
         msg["proc_ms"] = round(dt * 1000, 1)
-        net.push(msg, None if args.no_image else (t_cap, frame))
+        mask_w = cfg["net"].get("mask_width", 256)
+        mask = (t_cap, frame_mask(res, W, H, mask_w)) if res and msg["tracked"] and mask_w else None
+        net.push(msg, None if args.no_image else (t_cap, frame), mask)
 
         if msg["events"]:
             print(f"[gesture] {msg['events']}   {gest.debug}")
