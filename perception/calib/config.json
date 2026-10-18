@@ -1,6 +1,7 @@
 {
   "camera": {
     "index": 0,
+    "api": "auto",
     "width": 1280,
     "height": 720,
     "hfov_deg": 70.0,
@@ -27,7 +28,10 @@
     "torso_surface_offset_m": 0.10
   },
   "compute": {
-    "_note": "OpenVINO CPU thread budgets; 0 = auto (depth gets half the cores, pose + hands the rest). Depth is capped because the distance it feeds is smoothed at < 1 Hz.",
+    "_note": "backend: auto (ONNX Runtime if installed, else OpenVINO) | onnx | openvino. *_device: auto | ane (Apple Neural Engine) | gpu (Apple GPU, NVIDIA TensorRT/CUDA, DirectML) | cpu. auto = ane on Macs, gpu with NVIDIA, else cpu. *_threads: CPU inference thread budgets, 0 = auto (depth half the cores). Depth is capped because the distance it feeds is smoothed at < 1 Hz.",
+    "backend": "auto",
+    "pose_device": "auto",
+    "depth_device": "auto",
     "pose_threads": 0,
     "depth_threads": 0,
     "depth_max_hz": 12.0
@@ -62,5 +66,6 @@
     "fist_gap_tolerance_s": 0.5,
     "fist_max_drift_m": 0.15
   },
-  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75}
+  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75,
+          "_mask_note": "person-mask width sent to Unity for occlusion (0 = off)", "mask_width": 256}
 }

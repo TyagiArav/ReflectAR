@@ -6,7 +6,9 @@ Mirror frame -> gestures + range check -> TCP stream to Unity.
 Wire format (TCP, Python is the server, Unity connects):
     1 byte type ('J' = JSON tracking frame, 'I' = camera image)
     4 byte big-endian payload length
-    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG
+    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG;
+             'M' = float64 capture time + uint16 width + uint16 height + person mask
+                   (uint8, rows top first, 255 = person) used to trim the occlusion proxy
 
 Latency: each 'J' frame carries joint positions *and velocities* at the frame's capture time
 't' plus its send time 't_send'; Unity extrapolates them to the moment each rendered frame
@@ -14,14 +16,16 @@ reaches the screen (see filters.PosePredictor, TrackingClient.Predict).
 
 Run:  .venv/bin/python server.py [--snapshot debug.jpg] [--no-image]
 """
-import argparse, json, os, socket, struct, threading, time
+import argparse, json, os, socket, struct, sys, threading, time
+if sys.platform == "win32":                          # MSMF otherwise takes seconds to open a webcam
+    os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import numpy as np
 import cv2
-import openvino as ov
 
-from blazepose import BlazePose
-from handpose import HandPose, is_fist
-from depth import MonoDepth
+from backend import Backend, warmup
+from blazepose import BlazePose, DET_SIZE, LM_SIZE, frame_mask
+from handpose import HandPose, HAND_SIZE, is_fist
+from depth import MonoDepth, IN_H, IN_W
 from filters import OneEuro, PosePredictor
 from geometry import Intrinsics, skeleton_distance, CameraToMirror
 from gestures import Gestures, SIDES
@@ -34,15 +38,21 @@ TORSO = (11, 12, 23, 24)
 class Camera:
     """Grabs frames on a thread so inference never waits on the driver."""
 
-    def __init__(self, index, w, h, video=None):
+    APIS = {"avfoundation": cv2.CAP_AVFOUNDATION, "msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW,
+            "v4l2": cv2.CAP_V4L2, "any": cv2.CAP_ANY}
+
+    def __init__(self, index, w, h, video=None, api="auto"):
         self.video = video
-        self.cap = cv2.VideoCapture(video) if video else cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if api == "auto":
+            api = {"darwin": "avfoundation", "win32": "msmf"}.get(sys.platform, "any")
+        self.cap = cv2.VideoCapture(video) if video else cv2.VideoCapture(index, self.APIS[api])
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         if not self.cap.isOpened():
-            raise RuntimeError("Could not open camera. Grant camera access to your terminal app "
-                               "(System Settings > Privacy & Security > Camera).")
+            raise RuntimeError("Could not open camera. macOS: grant camera access to your terminal app "
+                               "(System Settings > Privacy & Security > Camera). Windows: Settings > Privacy > "
+                               "Camera, and close other apps using it; or try \"api\": \"dshow\" in config.json.")
         self.frame, self.stamp, self.seq = None, 0.0, 0
         self.cond = threading.Condition()
         threading.Thread(target=self._loop, daemon=True).start()
@@ -84,6 +94,7 @@ class Streamer:
         self.lock = threading.Condition()
         self.json_msg = None
         self.image = None                            # (capture time, BGR frame or JPEG bytes)
+        self.mask = None                             # (capture time, uint8 mask)
         threading.Thread(target=self._accept, daemon=True).start()
         threading.Thread(target=self._send, daemon=True).start()
         print(f"[net] listening on {host}:{port}")
@@ -102,7 +113,7 @@ class Streamer:
                     self.conn.close()
                 self.conn = c
 
-    def push(self, msg, image=None):
+    def push(self, msg, image=None, mask=None):
         with self.lock:
             if self.conn is None:
                 msg["events"] = []                   # nobody to act on them: don't replay later
@@ -111,18 +122,23 @@ class Streamer:
             self.json_msg = msg
             if image is not None:
                 self.image = image
+            if mask is not None:
+                self.mask = mask
             self.lock.notify()
 
     def _send(self):
         while True:
             with self.lock:
                 self.lock.wait_for(lambda: self.json_msg is not None and self.conn is not None)
-                msg, img, conn = self.json_msg, self.image, self.conn
-                self.json_msg, self.image = None, None
+                msg, img, mask, conn = self.json_msg, self.image, self.mask, self.conn
+                self.json_msg, self.image, self.mask = None, None, None
             try:
                 msg["t_send"] = time.time()
                 body = json.dumps(msg, separators=(",", ":")).encode()
                 conn.sendall(b"J" + struct.pack(">I", len(body)) + body)
+                if mask is not None:
+                    t_m, m = mask
+                    conn.sendall(b"M" + struct.pack(">IdHH", m.size + 12, t_m, m.shape[1], m.shape[0]) + m.tobytes())
                 if img is not None:
                     t_img, jpg = img
                     if not isinstance(jpg, bytes):
@@ -169,15 +185,6 @@ class HandWorker:
             with self.cond:
                 self.fists = fists
             self.ms = 0.9 * self.ms + 0.1 * (time.perf_counter() - t0) * 1000
-
-
-def cpu_config(core, threads):
-    """OpenVINO CPU settings for one model group. Pose and depth each get their own thread
-    budget with pinning off: with shared defaults, depth inference makes pose inference
-    ~4x slower (8 -> 35 ms on a 4-core test box); split like this it stays at ~10-14 ms."""
-    supported = core.get_property("CPU", "SUPPORTED_PROPERTIES")
-    cfg = {"PERFORMANCE_HINT": "LATENCY", "INFERENCE_NUM_THREADS": int(threads), "ENABLE_CPU_PINNING": False}
-    return {k: v for k, v in cfg.items() if k in supported}
 
 
 # ------------------------------------------------------------------ calibration
@@ -253,23 +260,27 @@ def main():
     ap.add_argument("--calib-dist", type=float, help="stand exactly this many metres from the camera; "
                     "calibrates the distance estimate and exits")
     ap.add_argument("--log", action="store_true", help="print tracking state every second")
+    ap.add_argument("--ep-log", action="store_true", help="ONNX Runtime info logging: shows how many nodes of "
+                    "each model Core ML / TensorRT took and what fell back to the CPU")
     args = ap.parse_args()
     cfg = json.load(open(args.config))
 
-    core = ov.Core()
-    core.set_property("CPU", {"CACHE_DIR": "models/cache"})
     comp = cfg.get("compute", {})
-    ncpu = os.cpu_count() or 4
-    depth_thr = comp.get("depth_threads") or max(1, ncpu // 2)
-    pose_thr = comp.get("pose_threads") or max(1, ncpu - depth_thr)
-    pose_cfg, depth_cfg = cpu_config(core, pose_thr), cpu_config(core, depth_thr)
-    pose = BlazePose(core, config=pose_cfg)
-    hands = HandWorker(HandPose(core, config=pose_cfg))
-    depth = MonoDepth(core, config=depth_cfg, max_hz=comp.get("depth_max_hz", 12.0))
-    print(f"[ov] {ncpu} CPUs: pose/hands {pose_thr} threads, depth {depth_thr} threads "
-          f"(capped at {comp.get('depth_max_hz', 12.0)} Hz)")
+    backend = Backend({**comp, "verbose": args.ep_log})
+    pose = BlazePose(backend)
+    hand_model = HandPose(backend)
+    depth_model_hz = comp.get("depth_max_hz", 12.0)
+    t_w = time.time()                                # compile Core ML programs / TensorRT engines now
+    warmup(pose.det, (1, DET_SIZE, DET_SIZE, 3)); warmup(pose.lm, (1, LM_SIZE, LM_SIZE, 3))
+    warmup(hand_model.model, (1, HAND_SIZE, HAND_SIZE, 3))
+    hands = HandWorker(hand_model)
+    depth = MonoDepth(backend, max_hz=depth_model_hz)
+    warmup(depth.model, (1, 3, IN_H, IN_W))
+    print(backend.summary())
+    print(f"[backend] devices {backend.devices}, CPU threads {backend.threads}, depth capped at "
+          f"{depth_model_hz} Hz, warm-up {time.time() - t_w:.1f} s")
     cc = cfg["camera"]
-    cam = Camera(cc["index"], cc["width"], cc["height"], args.video)
+    cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("api", "auto"))
     frame, _, seq = cam.read(0)
     H, W = frame.shape[:2]
     K = Intrinsics.load(cc, W, H)
@@ -375,7 +386,9 @@ def main():
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
         msg["proc_ms"] = round(dt * 1000, 1)
-        net.push(msg, None if args.no_image else (t_cap, frame))
+        mask_w = cfg["net"].get("mask_width", 256)
+        mask = (t_cap, frame_mask(res, W, H, mask_w)) if res and msg["tracked"] and mask_w else None
+        net.push(msg, None if args.no_image else (t_cap, frame), mask)
 
         if msg["events"]:
             print(f"[gesture] {msg['events']}   {gest.debug}")

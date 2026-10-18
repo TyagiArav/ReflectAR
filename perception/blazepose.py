@@ -1,13 +1,12 @@
-"""BlazePose (full) on OpenVINO: detector + landmark model with ROI tracking.
+"""BlazePose (full): detector + landmark model with ROI tracking.
 
-Re-implements MediaPipe's pose pipeline around the stock .tflite models, which
-OpenVINO reads directly. Outputs 33 landmarks in image pixels, 33 metric world
+Re-implements MediaPipe's pose pipeline around the stock models (backend.py runs them:
+the .tflite on OpenVINO, or the converted .onnx on ONNX Runtime / Core ML / CUDA). Outputs 33 landmarks in image pixels, 33 metric world
 landmarks (hip-centred, camera-aligned) and a person segmentation mask.
 """
 import math
 import numpy as np
 import cv2
-import openvino as ov
 
 DET_SIZE = 224
 LM_SIZE = 256
@@ -51,11 +50,9 @@ def roi_from_points(p_center, p_top, scale=1.25):
 
 
 class BlazePose:
-    def __init__(self, core: ov.Core, model_dir="models", device="CPU", config=None):
-        self.det = core.compile_model(f"{model_dir}/pose_detection.tflite", device, config or {})
-        self.lm = core.compile_model(f"{model_dir}/pose_landmark_full.tflite", device, config or {})
-        self.det_req = self.det.create_infer_request()
-        self.lm_req = self.lm.create_infer_request()
+    def __init__(self, backend):
+        self.det = backend.load("pose_detection", "pose")
+        self.lm = backend.load("pose_landmark_full", "pose")
         self.anchors = _gen_anchors()
         self.roi = None            # (center, side, rot) carried between frames
 
@@ -66,9 +63,9 @@ class BlazePose:
         padx, pady = (s - w) // 2, (s - h) // 2
         sq = cv2.copyMakeBorder(rgb, pady, s - h - pady, padx, s - w - padx, cv2.BORDER_CONSTANT)
         inp = cv2.resize(sq, (DET_SIZE, DET_SIZE)).astype(np.float32) / 127.5 - 1.0
-        res = self.det_req.infer({0: inp[None]})
-        raw = res[self.det.output(0)][0]
-        scores = sigmoid(res[self.det.output(1)][0, :, 0])
+        res = self.det(inp[None])
+        raw = res[0][0]
+        scores = sigmoid(res[1][0, :, 0])
         best = int(np.argmax(scores))
         if scores[best] < 0.5:
             return None
@@ -97,25 +94,25 @@ class BlazePose:
         crop = cv2.warpAffine(rgb, M, (LM_SIZE, LM_SIZE),
                               flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                               borderMode=cv2.BORDER_CONSTANT)
-        res = self.lm_req.infer({0: (crop.astype(np.float32) / 255.0)[None]})
-        flag = float(res[self.lm.output(1)].ravel()[0])
+        res = self.lm((crop.astype(np.float32) / 255.0)[None])
+        flag = float(res[1].ravel()[0])
         if flag > 1.0 or flag < 0.0:
             flag = float(sigmoid(flag))
         if flag < 0.5:
             return None
-        raw = res[self.lm.output(0)].reshape(39, 5)
+        raw = res[0].reshape(39, 5)
         uv = raw[:, :2] @ M[:, :2].T + M[:, 2]
         z = raw[:, 2] * side / LM_SIZE
         vis = sigmoid(raw[:, 3])
         pres = sigmoid(raw[:, 4])
 
-        world = res[self.lm.output(4)].reshape(39, 3).copy()
+        world = res[4].reshape(39, 3).copy()
         c, s = math.cos(rot), math.sin(rot)
         wx, wy = world[:, 0].copy(), world[:, 1].copy()
         world[:, 0] = c * wx - s * wy
         world[:, 1] = s * wx + c * wy
 
-        seg = sigmoid(res[self.lm.output(2)][0, :, :, 0])
+        seg = sigmoid(res[2][0, :, :, 0])
 
         # next-frame ROI from auxiliary keypoints 33 (hip centre) / 34 (above head)
         self.roi = roi_from_points(uv[33], uv[34])
@@ -123,3 +120,15 @@ class BlazePose:
             "uv": uv[:33], "z_px": z[:33], "vis": np.minimum(vis, pres)[:33],
             "world": world[:33], "score": flag, "seg": seg, "seg_affine": M,
         }
+
+
+def frame_mask(res, img_w, img_h, out_w):
+    """Person segmentation in full-frame coordinates, (out_h, out_w) uint8, 255 = person.
+
+    The landmark model segments its 256x256 crop; seg_affine maps crop pixels to image
+    pixels, so a scaled copy of it warps the mask into a small frame-aligned image."""
+    out_h = int(round(img_h * out_w / img_w))
+    M = res["seg_affine"] * (out_w / img_w)             # crop -> image -> mask pixels
+    m = cv2.warpAffine(res["seg"].astype(np.float32), M, (out_w, out_h), flags=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return (np.clip(m, 0, 1) * 255).astype(np.uint8)
