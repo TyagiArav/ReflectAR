@@ -1,0 +1,50 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 1280,
+    "height": 720,
+    "hfov_deg": 70.0,
+    "intrinsics_file": "calib/intrinsics.json"
+  },
+  "screen": {
+    "_note": "Active display area of the 14in MacBook Pro (3024x1964 @ 254 ppi). Mirror-frame origin = lower-left corner.",
+    "w_m": 0.302,
+    "h_m": 0.196,
+    "res_x": 3024,
+    "res_y": 1964
+  },
+  "camera_pose": {
+    "_note": "Camera optical centre in Mirror frame (metres) and downward pitch. Laptop camera sits ~8 mm above the active area, centred.",
+    "pos_m": [0.151, 0.204, 0.0],
+    "tilt_down_deg": 0.0
+  },
+  "range_m": [1.0, 3.0],
+  "depth": {
+    "_note": "Weight of the Depth Anything metric estimate vs the BlazePose skeleton-scale estimate when fusing user distance.",
+    "fusion_weight": 0.7,
+    "torso_surface_offset_m": 0.10
+  },
+  "filters": {
+    "joints": {"mincutoff": 1.2, "beta": 0.8},
+    "eye": {"mincutoff": 1.0, "beta": 0.5},
+    "scale_ema": 0.05
+  },
+  "gestures": {
+    "_note": "swipe distances are in shoulder widths (sw) in the 2D image, so they don't depend on distance",
+    "swipe_min_dx_sw": 0.9,
+    "swipe_window_s": 0.9,
+    "swipe_max_dy_sw": 1.8,
+    "swipe_min_dx_over_dy": 0.6,
+    "swipe_min_speed_sw": 1.2,
+    "swipe_min_vis": 0.25,
+    "swipe_min_height_sw": 0.35,
+    "swipe_gap_s": 0.25,
+    "swipe_cooldown_s": 0.6,
+    "swipe_reverse_block_s": 0.9,
+    "fist_blocks_swipe_after": 0.12,
+    "fist_hold_s": 5.0,
+    "fist_gap_tolerance_s": 0.5,
+    "fist_max_drift_m": 0.15
+  },
+  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75}
+}
