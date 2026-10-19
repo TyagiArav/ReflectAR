@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace ReflectAR
 {
@@ -10,6 +11,10 @@ namespace ReflectAR
     /// wrinkles), bending, gravity, inertia, damping and collisions against capsules fitted to the
     /// user's body. Each vertex is tethered to its skinned target by a max distance that is ~0 at the
     /// collar and shoulders and grows toward the hem and cuffs, which is how real garments hang.
+    ///
+    /// The solver runs on the welded mesh. What is drawn is a copy split along the UV seams of the
+    /// pattern-piece layout, with normals taken from the welded mesh (no shading seams) and
+    /// tangents for HDRP's normal maps, plus the front closure (GarmentTrims) riding on it.
     /// </summary>
     [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
     public class ClothGarment : MonoBehaviour
@@ -23,8 +28,10 @@ namespace ReflectAR
         public float LastBuildMs { get; private set; }
         public float LastStepMs { get; private set; }
 
-        Mesh mesh;
-        Material mat;
+        Mesh mesh, trimMesh;
+        MeshRenderer bodyRenderer, trimRenderer;
+        GarmentMaterials mats;
+        GarmentTrims trims;
         GarmentMeshData data;
         RestSkeleton built;
         bool hasMesh;
@@ -41,19 +48,34 @@ namespace ReflectAR
         float[] colBound = new float[0];
         bool simInit;
 
-        public void Init(GarmentSpec s, BodyRig b, Material baseMat)
+        // render mesh (split at UV seams)
+        int[] toSim;
+        Vector3[] rPos, rNrm, simN, tAcc, bAcc;
+        Vector4[] rTan;
+        bool tangents;
+
+        public void Init(GarmentSpec s, BodyRig b)
         {
             spec = s; body = b;
-            mesh = new Mesh { name = s.name, indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+            mesh = new Mesh { name = s.name, indexFormat = IndexFormat.UInt32 };
             mesh.MarkDynamic();
             GetComponent<MeshFilter>().sharedMesh = mesh;
-            mat = new Material(baseMat) { name = s.name };
-            mat.SetTexture("_BaseMap", PatternTex.Make(s));
-            mat.SetFloat("_Tile", 1f / Mathf.Max(s.tile, 0.01f));
-            mat.SetFloat("_Sheen", s.sheen);
-            mat.SetFloat("_Placket", s.placket);
-            GetComponent<MeshRenderer>().sharedMaterial = mat;
-            GetComponent<MeshRenderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            bodyRenderer = GetComponent<MeshRenderer>();
+
+            var tg = new GameObject("Trims", typeof(MeshFilter), typeof(MeshRenderer));
+            tg.transform.SetParent(transform, false);
+            trimMesh = new Mesh { name = s.name + " trims" };
+            trimMesh.MarkDynamic();
+            tg.GetComponent<MeshFilter>().sharedMesh = trimMesh;
+            trimRenderer = tg.GetComponent<MeshRenderer>();
+            tg.SetActive(false);
+
+            mats = new GarmentMaterials(s);
+            tangents = RenderLook.HDRP;                     // normal maps; the URP shader doesn't need them
+            // HDRP: the garment shadows itself (sleeves on the torso, collar on the neck)
+            var cast = RenderLook.HDRP ? ShadowCastingMode.On : ShadowCastingMode.Off;
+            bodyRenderer.shadowCastingMode = trimRenderer.shadowCastingMode = cast;
+            mats.Apply(bodyRenderer, trimRenderer, Alpha);
         }
 
         public void ResetCloth() => simInit = false;
@@ -65,7 +87,15 @@ namespace ReflectAR
             float d(float a, float b) => Mathf.Abs(a - b) / Mathf.Max(b, 1e-3f);
             return d(body.ShoulderW, built.sw) > 0.08f || d(body.TorsoLen, built.L) > 0.08f
                 || d(body.UpperL, built.upperL) > 0.12f || d(body.UpperR, built.upperR) > 0.12f
-                || d(body.ForeL, built.foreL) > 0.12f || d(body.ForeR, built.foreR) > 0.12f;
+                || d(body.ForeL, built.foreL) > 0.12f || d(body.ForeR, built.foreR) > 0.12f
+                || ProfileChanged();
+        }
+
+        bool ProfileChanged()
+        {
+            for (int i = 0; i < body.Profile.Length; i++)
+                if (Mathf.Abs(body.Profile[i] - built.profile[i]) > 0.05f) return true;
+            return false;
         }
 
         void BuildMesh()
@@ -85,15 +115,22 @@ namespace ReflectAR
             }
             BuildConstraints();
 
+            toSim = data.renderToSim;
+            int rn = toSim.Length;
+            rPos = new Vector3[rn]; rNrm = new Vector3[rn]; rTan = new Vector4[rn];
+            tAcc = new Vector3[rn]; bAcc = new Vector3[rn]; simN = new Vector3[n];
+            for (int r = 0; r < rn; r++) { rPos[r] = data.rest[toSim[r]]; rNrm[r] = data.restN[toSim[r]]; }
             mesh.Clear();
-            mesh.vertices = data.rest;
-            mesh.SetUVs(0, new List<Vector3>(data.rest));      // rest position -> seamless triplanar fabric
-            mesh.SetUVs(1, new List<Vector3>(data.restN));
-            mesh.triangles = data.tris;
-            mesh.RecalculateNormals();
+            mesh.SetVertices(rPos);
+            mesh.SetNormals(rNrm);
+            mesh.SetUVs(0, data.uv);                            // pattern pieces, metres (HDRP/Lit)
+            mesh.SetUVs(2, rPos);                               // rest position / normal -> seamless triplanar (URP)
+            mesh.SetUVs(3, rNrm);
+            mesh.SetTriangles(data.renderTris, 0);
+            mesh.RecalculateBounds();
 
-            mat.SetVector("_Front", new Vector4(built.L + 0.06f * u, spec.hem * built.L,
-                Mathf.Lerp(spec.hem * built.L, built.L + 0.06f * u, 1f - spec.placketLen), u));
+            trims = GarmentTrims.Build(data, built, spec, trimMesh);
+            trimRenderer.gameObject.SetActive(trims != null);
             // bone rest frames
             var rf = RestFrames(built);
             for (int b = 0; b < 6; b++) restInv[b] = rf[b].inverse;
@@ -294,11 +331,58 @@ namespace ReflectAR
                     x[i] = p;
                 }
             }
-            mesh.vertices = x;
-            mesh.RecalculateNormals();
-            mesh.RecalculateBounds();
-            mat.SetFloat("_Alpha", Alpha);
+            UpdateRenderMesh();
+            trims?.Update(x, simN, trimMesh);
+            mats.Apply(bodyRenderer, trimRenderer, Alpha);
             LastStepMs = (float)sw.Elapsed.TotalMilliseconds;
+        }
+
+        /// <summary>Copies the simulated cloth into the seam-split render mesh.</summary>
+        void UpdateRenderMesh()
+        {
+            // normals on the welded mesh, so UV seams don't show in the shading
+            System.Array.Clear(simN, 0, simN.Length);
+            var st = data.tris;
+            for (int t = 0; t < st.Length; t += 3)
+            {
+                int a = st[t], b = st[t + 1], c = st[t + 2];
+                Vector3 fn = Vector3.Cross(x[b] - x[a], x[c] - x[a]);
+                simN[a] += fn; simN[b] += fn; simN[c] += fn;
+            }
+            for (int i = 0; i < simN.Length; i++) simN[i] = simN[i].normalized;
+            for (int r = 0; r < toSim.Length; r++) { rPos[r] = x[toSim[r]]; rNrm[r] = simN[toSim[r]]; }
+            mesh.SetVertices(rPos);
+            mesh.SetNormals(rNrm);
+            if (tangents) { Tangents(); mesh.SetTangents(rTan); }
+            mesh.RecalculateBounds();
+        }
+
+        /// <summary>Per-vertex tangent along the fabric's u direction, with handedness.</summary>
+        void Tangents()
+        {
+            System.Array.Clear(tAcc, 0, tAcc.Length);
+            System.Array.Clear(bAcc, 0, bAcc.Length);
+            var rt = data.renderTris; var uv = data.uv;
+            for (int t = 0; t < rt.Length; t += 3)
+            {
+                int i0 = rt[t], i1 = rt[t + 1], i2 = rt[t + 2];
+                Vector3 e1 = rPos[i1] - rPos[i0], e2 = rPos[i2] - rPos[i0];
+                Vector2 d1 = uv[i1] - uv[i0], d2 = uv[i2] - uv[i0];
+                float det = d1.x * d2.y - d2.x * d1.y;
+                if (Mathf.Abs(det) < 1e-12f) continue;
+                float inv = 1f / det;
+                Vector3 T = (e1 * d2.y - e2 * d1.y) * inv, B = (e2 * d1.x - e1 * d2.x) * inv;
+                tAcc[i0] += T; tAcc[i1] += T; tAcc[i2] += T;
+                bAcc[i0] += B; bAcc[i1] += B; bAcc[i2] += B;
+            }
+            for (int r = 0; r < rTan.Length; r++)
+            {
+                Vector3 n = rNrm[r], T = tAcc[r] - n * Vector3.Dot(n, tAcc[r]);
+                if (T.sqrMagnitude < 1e-12f) T = Vector3.Cross(n, Mathf.Abs(n.y) < 0.9f ? Vector3.up : Vector3.right);
+                T.Normalize();
+                float w = Vector3.Dot(Vector3.Cross(n, T), bAcc[r]) < 0f ? -1f : 1f;
+                rTan[r] = new Vector4(T.x, T.y, T.z, w);
+            }
         }
     }
 }

@@ -82,6 +82,10 @@ namespace ReflectAR
         public double FeedCaptureTime { get; private set; } = double.NegativeInfinity;
         /// <summary>Person segmentation in camera-image coordinates (R8, v = 0 at the image top).</summary>
         public Texture2D Mask { get; private set; }
+        /// <summary>The same mask on the CPU (row 0 = image top), for measuring the body's silhouette.</summary>
+        public byte[] MaskBytes { get; private set; }
+        public int MaskWidth => Mask != null ? Mask.width : 0;
+        public int MaskHeight => Mask != null ? Mask.height : 0;
         public double MaskCaptureTime { get; private set; } = double.NegativeInfinity;
 
         /// <summary>Monotonic local clock (s), usable from any thread.</summary>
@@ -236,6 +240,7 @@ namespace ReflectAR
                         { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear };
                 Mask.LoadRawTextureData(mask);
                 Mask.Apply(false);
+                MaskBytes = mask;
                 MaskCaptureTime = maskT + clockOffset;
             }
         }

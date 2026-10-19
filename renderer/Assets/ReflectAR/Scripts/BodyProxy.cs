@@ -34,7 +34,8 @@ namespace ReflectAR
             (LM.LHip, LM.LKnee, 0.07f), (LM.RHip, LM.RKnee, 0.07f), (LM.LKnee, LM.LAnkle, 0.055f), (LM.RKnee, LM.RAnkle, 0.055f),
         };
 
-        public BodyProxy(Transform parent, Material m)
+        /// <param name="castShadows">HDRP: hands, arms and head shadow the garment</param>
+        public BodyProxy(Transform parent, Material m, bool castShadows)
         {
             mat = m;
             var root = new GameObject("BodyProxy").transform;
@@ -45,7 +46,7 @@ namespace ReflectAR
                 Object.Destroy(go.GetComponent<Collider>());
                 renderers[i] = go.GetComponent<MeshRenderer>();
                 renderers[i].sharedMaterial = mat;
-                renderers[i].shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                renderers[i].shadowCastingMode = castShadows ? UnityEngine.Rendering.ShadowCastingMode.On : UnityEngine.Rendering.ShadowCastingMode.Off;
                 go.transform.SetParent(root, false);
                 parts[i] = go.transform;
             }

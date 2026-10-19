@@ -43,6 +43,15 @@ namespace ReflectAR
         public float UpperL = 0.29f, UpperR = 0.29f, ForeL = 0.26f, ForeR = 0.26f;
         public Capsule[] Colliders = new Capsule[0];
 
+        /// <summary>Measured torso half-width relative to the generic model, at the heights in
+        /// <see cref="BodyShape.Levels"/> (1 = average build). Filled in from the person mask.</summary>
+        public readonly float[] Profile = { 1f, 1f, 1f, 1f, 1f, 1f };
+
+        public void ResetShape()
+        {
+            for (int i = 0; i < Profile.Length; i++) Profile[i] = 1f;
+        }
+
         /// <summary>Body-relative unit: 1 for a 0.36 m shoulder-joint span. Garment and proxy
         /// dimensions scale with it, so the overlay fits even if absolute distance is off.</summary>
         public float Unit => ShoulderW / 0.36f;

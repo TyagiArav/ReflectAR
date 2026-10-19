@@ -14,6 +14,9 @@ namespace ReflectAR
     /// Mirror: what the two-way-mirror build needs. Black background, garments placed on the
     ///   reflected body (MirrorWorld scale z = -1), rendered with an off-axis frustum from the
     ///   tracked eye through the physical screen rectangle.
+    ///
+    /// Runs under URP or HDRP (ReflectAR > Render Pipeline menu). HDRP adds physically based
+    /// fabric (HDRP/Lit with weave normal maps), soft shadows, SSAO and contact shadows (HdrpLook).
     /// </summary>
     public class MirrorApp : MonoBehaviour
     {
@@ -32,13 +35,15 @@ namespace ReflectAR
         Camera cam;
         Transform mirrorWorld;
         readonly BodyRig body = new BodyRig();
+        readonly BodyShape shape = new BodyShape();
         ClothGarment[] garments;
         GarmentSpec[] specs;
         BodyProxy proxy;
         readonly Vector3[] maskJoints = new Vector3[33];
         MirrorUI ui;
         GameObject feedQuad, cube;
-        Light keyLight;
+        Light keyLight, fillLight;
+        bool hdrp;
         Mesh feedMesh;
         Material feedMat;
 
@@ -61,8 +66,13 @@ namespace ReflectAR
             cam.farClipPlane = 20f;
 
             mirrorWorld = new GameObject("MirrorWorld").transform;
+            hdrp = RenderLook.HDRP;
+            if (hdrp)
+            {
+                HdrpLook.SetupCamera(cam);
+                HdrpLook.CreateVolume();
+            }
 
-            var garmentMat = new Material(Shader.Find("ReflectAR/Garment"));
             specs = GarmentCatalog.All;
             garments = new ClothGarment[specs.Length];
             for (int i = 0; i < specs.Length; i++)
@@ -70,13 +80,13 @@ namespace ReflectAR
                 var go = new GameObject("Garment_" + specs[i].name, typeof(MeshFilter), typeof(MeshRenderer));
                 go.transform.SetParent(mirrorWorld, false);
                 var g = go.AddComponent<ClothGarment>();
-                g.Init(specs[i], body, garmentMat);
+                g.Init(specs[i], body);
                 go.SetActive(false);
                 garments[i] = g;
             }
             garments[current].gameObject.SetActive(true);
 
-            proxy = new BodyProxy(mirrorWorld, new Material(Shader.Find("ReflectAR/DepthOnly")));
+            proxy = new BodyProxy(mirrorWorld, new Material(Shader.Find("ReflectAR/DepthOnly")), hdrp);
 
             feedMat = new Material(Shader.Find("ReflectAR/Feed"));
             feedQuad = new GameObject("CameraFeed", typeof(MeshFilter), typeof(MeshRenderer));
@@ -91,11 +101,19 @@ namespace ReflectAR
             Destroy(cube.GetComponent<Collider>());
             cube.name = "CubeTest";
             cube.transform.localScale = Vector3.one * 0.2f;
-            cube.GetComponent<MeshRenderer>().sharedMaterial = new Material(garmentMat);
+            cube.GetComponent<MeshRenderer>().sharedMaterial = GarmentMaterials.Plain(new Color(0.8f, 0.8f, 0.8f));
             cube.SetActive(false);
 
             keyLight = FindAnyObjectByType<Light>();
-            if (keyLight != null)
+            if (keyLight == null) keyLight = new GameObject("KeyLight").AddComponent<Light>();
+            if (hdrp)
+            {
+                // key with soft shadows, plus a dim fill from the other side so shadowed folds aren't black
+                HdrpLook.SetupLight(keyLight, HdrpLook.KeyLux, true, 6f);
+                fillLight = new GameObject("FillLight").AddComponent<Light>();
+                HdrpLook.SetupLight(fillLight, HdrpLook.FillLux, false, 0f);
+            }
+            else
             {
                 keyLight.type = LightType.Directional;
                 keyLight.intensity = 1.1f;
@@ -163,33 +181,53 @@ namespace ReflectAR
                 bool matchFeed = mode == ViewMode.CameraFeed && now - client.FeedCaptureTime < 0.5;
                 double target = matchFeed ? client.FeedCaptureTime : now + client.DisplayLatency + leadMs * 0.001;
                 client.Predict(target, predict, predict && !matchFeed);
+                if (!hadBody) shape.Reset(body);                 // a new person: measure them from scratch
                 body.Update(client.Joints, client.Visibility, Time.deltaTime, !hadBody || Time.time - lastTracked > 0.5f);
                 hadBody = true;
                 lastTracked = Time.time;
             }
             // hold the last pose 0.5 s, then fade over 0.3 s; dim while out of range
-            float target = !hadBody || Time.time - lastTracked > 0.5f ? 0f : (f != null && f.range == "ok" ? 1f : 0.35f);
-            visible = Mathf.MoveTowards(visible, target, Time.deltaTime / 0.3f);
+            float fadeTo = !hadBody || Time.time - lastTracked > 0.5f ? 0f : (f != null && f.range == "ok" ? 1f : 0.35f);
+            visible = Mathf.MoveTowards(visible, fadeTo, Time.deltaTime / 0.3f);
             if (visible <= 0f && Time.time - lastTracked > 0.8f) hadBody = false;
 
             mirrorWorld.localScale = mode == ViewMode.Mirror ? new Vector3(1, 1, -1) : Vector3.one;
             // key light from above, beside the screen, falling on the (real or reflected) front of the body
-            if (keyLight != null)
-                keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, mode == ViewMode.Mirror ? 1f : -1f));
+            float zs = mode == ViewMode.Mirror ? 1f : -1f;
+            keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, zs));
+            if (fillLight != null) fillLight.transform.rotation = Quaternion.LookRotation(new Vector3(-0.7f, -0.2f, zs));
 
             var g = garments[current];
             g.Alpha = visible;
             g.gameObject.SetActive(visible > 0.001f);
             if (body.Valid && visible > 0f) g.Step(Time.deltaTime);
-            bool maskOn = trimToMask && tracked && client.Mask != null && TrackingClient.Now - client.MaskCaptureTime < 0.3;
-            if (maskOn)
+            bool maskFresh = tracked && client.Mask != null && TrackingClient.Now - client.MaskCaptureTime < 0.3;
+            bool maskOn = trimToMask && maskFresh;
+            if (maskFresh)
             {
                 client.PoseAt(client.MaskCaptureTime, maskJoints);
+                // measure the user's build from the silhouette, a few times a second
+                if (f.range == "ok" && Time.frameCount % 4 == 0)
+                {
+                    Vector3 cp = CamPosMirror(f.cam);
+                    shape.Measure(client.MaskBytes, client.MaskWidth, client.MaskHeight, MaskMatrix(f.cam), maskJoints, body,
+                        new Vector3(cp.x, cp.y, -cp.z), Time.deltaTime * 4f);
+                }
+            }
+            if (maskOn)
+            {
                 Shader.SetGlobalTexture("_ReflectARMask", client.Mask);
-                Shader.SetGlobalMatrix("_ReflectARMaskMatrix", MaskMatrix(f.cam));
-                Shader.SetGlobalMatrix("_ReflectARWorldToBody", mirrorWorld.worldToLocalMatrix);
                 Shader.SetGlobalFloat("_ReflectARMaskThreshold", 0.5f);
             }
+            if (f != null && f.cam != null && f.cam.fx > 0)
+            {
+                Shader.SetGlobalMatrix("_ReflectARMaskMatrix", MaskMatrix(f.cam));
+                Shader.SetGlobalMatrix("_ReflectARWorldToBody", mirrorWorld.worldToLocalMatrix);
+            }
+            // HDRP: the proxies show the feed where they cover it (see ReflectAR_DepthOnly.shader)
+            bool feedOn = mode == ViewMode.CameraFeed && f != null && f.cam != null && f.cam.fx > 0;
+            Shader.SetGlobalTexture("_ReflectARFeed", client.Feed);
+            Shader.SetGlobalFloat("_ReflectARFeedOn", feedOn ? (f.range == "ok" || !f.tracked ? 1f : 0.6f) : 0f);
             proxy.Update(body, body.Valid && visible > 0f, showProxy, specs[current].tank ? 0f : specs[current].sleeve, maskOn ? maskJoints : null);
             UpdateFeedQuad(f);
             cube.SetActive(cubeTest && mode == ViewMode.Mirror);
