@@ -149,7 +149,8 @@ namespace ReflectAR
             if (g.neck == Neckline.HoodDown)                                     // rolled hood lying on the upper back
             {
                 Vector3 q = p - new Vector3(0, s.L + 0.02f * u, -0.075f * u);
-                q = Quaternion.Euler(-35f, 0, 0) * q;
+                float ca = Mathf.Cos(-35f * Mathf.Deg2Rad), sa = Mathf.Sin(-35f * Mathf.Deg2Rad);
+                q = new Vector3(q.x, ca * q.y - sa * q.z, sa * q.y + ca * q.z);           // rotate about X
                 float ring = new Vector2(new Vector2(q.x, q.z).magnitude - 0.105f * u, q.y).magnitude - 0.045f * u;
                 ring = Mathf.Max(ring, p.z - (0.01f * u));                        // back half only
                 body = SMin(body, ring, 0.03f * u);

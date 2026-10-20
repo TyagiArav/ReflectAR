@@ -50,7 +50,7 @@ namespace ReflectAR
         public Quaternion ChestRot => Quaternion.LookRotation(Fwd, Up);
         public Quaternion PelvisRot => Quaternion.LookRotation(PFwd, Up);
 
-        public float smoothing = 30f;               // 1/s, extra interpolation between 30 Hz frames
+        public float smoothing = 90f;               // 1/s: light interpolation between camera frames (perception already filters)
         bool measured;
 
         public void Update(Vector3[] target, float[] vis, float dt, bool snap)

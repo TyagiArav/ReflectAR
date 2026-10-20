@@ -36,7 +36,7 @@ namespace ReflectAR
         public float[] eye;      // 3
         public CamInfo cam;
         public ScreenInfo screen;
-        public float proc_fps, depth_hz, scale, z_skel, z_da;
+        public float proc_fps, depth_hz, scale, z_skel, z_da, lat_ms, cam_fps;
     }
 
     /// <summary>

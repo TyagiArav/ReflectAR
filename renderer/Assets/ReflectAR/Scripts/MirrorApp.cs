@@ -137,8 +137,25 @@ namespace ReflectAR
         }
 
         // ------------------------------------------------------------------ frame
+        // frame-time stats, logged every 3 s (worst frame, cloth cost, mesh rebuilds)
+        float statT, statWorst, statSum, statCloth; int statN, statRebuilds;
+
+        void LogStats()
+        {
+            float dt = Time.unscaledDeltaTime;
+            statWorst = Mathf.Max(statWorst, dt); statSum += dt; statN++;
+            var g = garments[current];
+            statCloth = Mathf.Max(statCloth, g.LastStepMs);
+            if (Time.realtimeSinceStartup - statT < 3f) return;
+            int rb = 0; foreach (var gg in garments) rb += gg.RebuildCount;
+            Debug.Log($"[ReflectAR stats] avg {statN / statSum:0} fps, worst frame {statWorst * 1000:0} ms, " +
+                      $"cloth max {statCloth:0.0} ms, rebuilds +{rb - statRebuilds} (last {g.LastBuildMs:0} ms), verts {g.VertexCount}");
+            statT = Time.realtimeSinceStartup; statWorst = statSum = statCloth = 0; statN = 0; statRebuilds = rb;
+        }
+
         void Update()
         {
+            LogStats();
             HandleInput();
             var f = client.Latest;
             bool fresh = client.Connected && f != null && Time.time - client.LastFrameTime < 0.5f;
@@ -159,6 +176,7 @@ namespace ReflectAR
             if (keyLight != null)
                 keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, mode == ViewMode.Mirror ? 1f : -1f));
 
+            if (body.Valid) foreach (var gg in garments) gg.Prepare();   // background, so swiping never waits
             var g = garments[current];
             g.Alpha = visible;
             g.gameObject.SetActive(visible > 0.001f);

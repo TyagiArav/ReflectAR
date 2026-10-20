@@ -147,7 +147,7 @@ namespace ReflectAR
             if (showDebug)
                 debug.text = f == null
                     ? $"{(connected ? "connected" : "no perception")}  ·  [M] mode  [←/→] browse  [Space] select  [B] proxy  [C] cube  [D] debug"
-                    : $"{mode}  ·  perception {f.proc_fps:0} fps  depth {f.depth_hz:0} Hz  ·  dist {f.dist:0.00} m (skel {f.z_skel:0.00} / mono {f.z_da:0.00}, s={f.scale:0.00})  ·  render {1f / Mathf.Max(Time.smoothDeltaTime, 1e-3f):0} fps  ·  [M] mode [B] proxy [C] cube [D] debug";
+                    : $"{mode}  ·  camera {f.cam_fps:0} fps  perception {f.proc_fps:0} fps ({f.lat_ms:0} ms)  depth {f.depth_hz:0} Hz  ·  dist {f.dist:0.00} m (skel {f.z_skel:0.00} / mono {f.z_da:0.00}, s={f.scale:0.00})  ·  render {1f / Mathf.Max(Time.smoothDeltaTime, 1e-3f):0} fps  ·  [M] mode [B] proxy [C] cube [D] debug";
         }
 
         // ------------------------------------------------------------------ helpers

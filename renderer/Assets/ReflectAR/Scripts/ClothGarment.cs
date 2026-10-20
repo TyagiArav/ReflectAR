@@ -17,11 +17,13 @@ namespace ReflectAR
         public GarmentSpec spec;
         public BodyRig body;
         public int substeps = 3;
+        [Range(0, 1)] public float follow = 0.9f;  // share of body motion the cloth inherits directly
 
         public float Alpha { get; set; } = 1f;
         public int VertexCount => x?.Length ?? 0;
         public float LastBuildMs { get; private set; }
         public float LastStepMs { get; private set; }
+        public int RebuildCount { get; private set; }
 
         Mesh mesh;
         Material mat;
@@ -30,7 +32,7 @@ namespace ReflectAR
         bool hasMesh;
 
         // simulation state
-        Vector3[] x, prev, target;
+        Vector3[] x, prev, target, lastTarget;
         float[] maxDist, skinK;
         int[] eA, eB, bA, bB;
         float[] eRest, bRest;
@@ -59,52 +61,57 @@ namespace ReflectAR
         public void ResetCloth() => simInit = false;
 
         // ---------------------------------------------------------------- mesh (re)build
-        bool NeedsRebuild()
+        // Generating a garment takes 100-250 ms, so it always runs on a worker thread and the
+        // finished result is swapped in on the main thread; the render loop never waits for it.
+
+        class Built
         {
-            if (!hasMesh) return true;
-            float d(float a, float b) => Mathf.Abs(a - b) / Mathf.Max(b, 1e-3f);
-            return d(body.ShoulderW, built.sw) > 0.08f || d(body.TorsoLen, built.L) > 0.08f
-                || d(body.UpperL, built.upperL) > 0.12f || d(body.UpperR, built.upperR) > 0.12f
-                || d(body.ForeL, built.foreL) > 0.12f || d(body.ForeR, built.foreR) > 0.12f;
+            public RestSkeleton skel;
+            public GarmentMeshData data;
+            public float[] maxDist, skinK, eRest, bRest;
+            public int[] eA, eB, bA, bB;
+            public float ms;
         }
 
-        void BuildMesh()
+        System.Threading.Tasks.Task<Built> pending;
+        float driftSince = -1f, lastApplied = -100f;
+
+        /// <summary>Start generating this garment for the current body if needed (cheap to call every frame).</summary>
+        public void Prepare()
+        {
+            if (body == null || !body.Valid || pending != null) return;
+            bool rebuild = !hasMesh;
+            if (hasMesh)
+            {
+                float d(float a, float b) => Mathf.Abs(a - b) / Mathf.Max(b, 1e-3f);
+                bool drift = d(body.ShoulderW, built.sw) > 0.25f || d(body.TorsoLen, built.L) > 0.25f
+                    || d(body.UpperL, built.upperL) > 0.3f || d(body.UpperR, built.upperR) > 0.3f
+                    || d(body.ForeL, built.foreL) > 0.3f || d(body.ForeR, built.foreR) > 0.3f;
+                // only a sustained change in the user's proportions (new person, or measurements
+                // settling) is worth a rebuild; tracking jitter is not
+                if (!drift) driftSince = -1f;
+                else if (driftSince < 0f) driftSince = Time.time;
+                rebuild = drift && Time.time - driftSince > 2f && Time.time - lastApplied > 10f;
+            }
+            if (!rebuild) return;
+            var skel = RestSkeleton.From(body);
+            var g = spec;
+            pending = System.Threading.Tasks.Task.Run(() => Generate(skel, g));
+        }
+
+        static Built Generate(RestSkeleton skel, GarmentSpec spec)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            built = RestSkeleton.From(body);
-            data = GarmentMesher.Build(built, spec);
-            int n = data.rest.Length;
-            x = new Vector3[n]; prev = new Vector3[n]; target = new Vector3[n];
-            maxDist = new float[n]; skinK = new float[n];
-            float u = built.u;
+            var r = new Built { skel = skel, data = GarmentMesher.Build(skel, spec) };
+            int n = r.data.rest.Length;
+            r.maxDist = new float[n]; r.skinK = new float[n];
             for (int i = 0; i < n; i++)
             {
-                float l = data.looseness[i];
-                maxDist[i] = Mathf.Lerp(0.002f, (0.03f + spec.ease) * spec.drape * u, Mathf.Pow(l, 1.4f));
-                skinK[i] = Mathf.Lerp(0.6f, 0.015f, Mathf.Pow(l, 0.7f));
+                float l = r.data.looseness[i];
+                r.maxDist[i] = Mathf.Lerp(0.002f, (0.03f + spec.ease) * spec.drape * skel.u, Mathf.Pow(l, 1.4f));
+                r.skinK[i] = Mathf.Lerp(0.6f, 0.015f, Mathf.Pow(l, 0.7f));
             }
-            BuildConstraints();
-
-            mesh.Clear();
-            mesh.vertices = data.rest;
-            mesh.SetUVs(0, new List<Vector3>(data.rest));      // rest position -> seamless triplanar fabric
-            mesh.SetUVs(1, new List<Vector3>(data.restN));
-            mesh.triangles = data.tris;
-            mesh.RecalculateNormals();
-
-            mat.SetVector("_Front", new Vector4(built.L + 0.06f * u, spec.hem * built.L,
-                Mathf.Lerp(spec.hem * built.L, built.L + 0.06f * u, 1f - spec.placketLen), u));
-            // bone rest frames
-            var rf = RestFrames(built);
-            for (int b = 0; b < 6; b++) restInv[b] = rf[b].inverse;
-            hasMesh = true;
-            simInit = false;
-            LastBuildMs = (float)sw.Elapsed.TotalMilliseconds;
-        }
-
-        void BuildConstraints()
-        {
-            var tris = data.tris;
+            var tris = r.data.tris;
             var edgeSet = new Dictionary<long, int>();             // edge -> first opposite vertex
             var eAl = new List<int>(); var eBl = new List<int>(); var bAl = new List<int>(); var bBl = new List<int>();
             long Key(int a, int b) => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
@@ -116,10 +123,45 @@ namespace ReflectAR
                     if (edgeSet.TryGetValue(k, out int o)) { if (o != opp) { bAl.Add(o); bBl.Add(opp); } }   // bending across the shared edge
                     else { edgeSet[k] = opp; eAl.Add(a); eBl.Add(b); }
                 }
-            eA = eAl.ToArray(); eB = eBl.ToArray(); bA = bAl.ToArray(); bB = bBl.ToArray();
-            eRest = new float[eA.Length]; bRest = new float[bA.Length];
-            for (int i = 0; i < eA.Length; i++) eRest[i] = Vector3.Distance(data.rest[eA[i]], data.rest[eB[i]]);
-            for (int i = 0; i < bA.Length; i++) bRest[i] = Vector3.Distance(data.rest[bA[i]], data.rest[bB[i]]);
+            r.eA = eAl.ToArray(); r.eB = eBl.ToArray(); r.bA = bAl.ToArray(); r.bB = bBl.ToArray();
+            r.eRest = new float[r.eA.Length]; r.bRest = new float[r.bA.Length];
+            for (int i = 0; i < r.eA.Length; i++) r.eRest[i] = Vector3.Distance(r.data.rest[r.eA[i]], r.data.rest[r.eB[i]]);
+            for (int i = 0; i < r.bA.Length; i++) r.bRest[i] = Vector3.Distance(r.data.rest[r.bA[i]], r.data.rest[r.bB[i]]);
+            r.ms = (float)sw.Elapsed.TotalMilliseconds;
+            return r;
+        }
+
+        /// <summary>Swap in a finished background build (main thread; ~1 ms).</summary>
+        void ApplyPending()
+        {
+            if (pending == null || !pending.IsCompleted) return;
+            var t = pending; pending = null;
+            if (t.IsFaulted) { Debug.LogException(t.Exception); return; }
+            var r = t.Result;
+            built = r.skel; data = r.data;
+            maxDist = r.maxDist; skinK = r.skinK;
+            eA = r.eA; eB = r.eB; bA = r.bA; bB = r.bB; eRest = r.eRest; bRest = r.bRest;
+            int n = data.rest.Length;
+            x = new Vector3[n]; prev = new Vector3[n]; target = new Vector3[n]; lastTarget = new Vector3[n];
+
+            mesh.Clear();
+            mesh.vertices = data.rest;
+            mesh.SetUVs(0, new List<Vector3>(data.rest));      // rest position -> seamless triplanar fabric
+            mesh.SetUVs(1, new List<Vector3>(data.restN));
+            mesh.triangles = data.tris;
+            mesh.RecalculateNormals();
+
+            float u = built.u;
+            mat.SetVector("_Front", new Vector4(built.L + 0.06f * u, spec.hem * built.L,
+                Mathf.Lerp(spec.hem * built.L, built.L + 0.06f * u, 1f - spec.placketLen), u));
+            var rf = RestFrames(built);
+            for (int b = 0; b < 6; b++) restInv[b] = rf[b].inverse;
+            hasMesh = true;
+            simInit = false;
+            lastApplied = Time.time;
+            driftSince = -1f;
+            LastBuildMs = r.ms;
+            RebuildCount++;
         }
 
         // ---------------------------------------------------------------- bones
@@ -205,12 +247,24 @@ namespace ReflectAR
         public void Step(float dt)
         {
             if (body == null || !body.Valid) return;
-            if (NeedsRebuild()) BuildMesh();
+            ApplyPending();
+            Prepare();
+            if (!hasMesh) { GetComponent<MeshRenderer>().enabled = false; return; }
+            GetComponent<MeshRenderer>().enabled = true;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             SkinTargets();
             BuildColliders();
             int n = x.Length;
-            if (!simInit) { System.Array.Copy(target, x, n); System.Array.Copy(target, prev, n); simInit = true; }
+            if (!simInit) { System.Array.Copy(target, x, n); System.Array.Copy(target, prev, n); System.Array.Copy(target, lastTarget, n); simInit = true; }
+            // Carry the cloth along with the body's own motion (like Unity Cloth's world velocity
+            // scale): only (1 - follow) of each movement is left to inertia, so the garment no
+            // longer trails behind the user, but still swings and wrinkles locally.
+            for (int i = 0; i < n; i++)
+            {
+                Vector3 moved = (target[i] - lastTarget[i]) * follow;
+                x[i] += moved; prev[i] += moved;
+                lastTarget[i] = target[i];
+            }
 
             dt = Mathf.Min(dt, 1f / 30f);
             float h = dt / substeps;

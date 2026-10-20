@@ -30,12 +30,13 @@ TORSO = (11, 12, 23, 24)
 class Camera:
     """Grabs frames on a thread so inference never waits on the driver."""
 
-    def __init__(self, index, w, h, video=None):
+    def __init__(self, index, w, h, video=None, fps=30):
         self.video = video
         self.cap = cv2.VideoCapture(video) if video else cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)            # never hand us a stale queued frame
         if not self.cap.isOpened():
             raise RuntimeError("Could not open camera. Grant camera access to your terminal app "
                                "(System Settings > Privacy & Security > Camera).")
@@ -204,7 +205,7 @@ def main():
     hands = HandPose(core)
     depth = MonoDepth(core)
     cc = cfg["camera"]
-    cam = Camera(cc["index"], cc["width"], cc["height"], args.video)
+    cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("fps", 30))
     frame, _, seq = cam.read(0)
     H, W = frame.shape[:2]
     K = Intrinsics.load(cc, W, H)
@@ -213,7 +214,7 @@ def main():
     gest = Gestures(cfg["gestures"])
     rng = RangeCheck(*cfg["range_m"])
     fj, fe = cfg["filters"]["joints"], cfg["filters"]["eye"]
-    f_joints, f_eye, f_dist = OneEuro(**fj), OneEuro(**fe), OneEuro(0.5, 0.3)
+    f_joints, f_eye, f_dist = OneEuro(**fj), OneEuro(**fe), OneEuro(1.0, 1.5)
     wfuse = cfg["depth"]["fusion_weight"]
     cal = load_depth_calib()
     calib = DistanceCalibrator(args.calib_dist, cal) if args.calib_dist else None
@@ -223,6 +224,7 @@ def main():
 
     jpeg_w, jpeg_q = cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"]
     fps, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, ""
+    cam_fps, last_stamp = 30.0, time.time()
     while True:
         frame, stamp, seq = cam.read(seq)
         t0 = time.time()
@@ -303,6 +305,9 @@ def main():
         dt = time.time() - t0
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
+        cam_fps = 0.9 * cam_fps + 0.1 / max(stamp - last_stamp, 1e-3); last_stamp = stamp
+        msg["lat_ms"] = round((time.time() - stamp) * 1000, 1)
+        msg["cam_fps"] = round(cam_fps, 1)
         net.push(msg, jpg)
 
         if msg["events"]:
@@ -314,7 +319,7 @@ def main():
             t_log = stamp
             print(f"[state] tracked={msg['tracked']} range={msg['range']} dist={msg['dist']:.2f} "
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "
-                  f"fists={fists} prog={msg['fist_progress']} proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
+                  f"fists={fists} prog={msg['fist_progress']} proc={fps:.0f}fps cam={cam_fps:.0f}fps lat={msg['lat_ms']}ms depth={depth.hz:.0f}Hz "
                   f"net={'up' if net.connected else 'down'}")
         if args.snapshot and stamp - t_snap > 1.0:
             t_snap = stamp
