@@ -95,7 +95,9 @@ namespace ReflectAR
     /// </summary>
     public static class GarmentMesher
     {
-        const float Cell = 0.017f;
+        // Voxel size of the build; set per call (thread-static, since builds run on worker threads).
+        [System.ThreadStatic] static float Cell;
+        public const float DefaultCell = 0.017f;
 
         // ---------------------------------------------------------------- SDF helpers
         static float SMin(float a, float b, float k)
@@ -222,7 +224,8 @@ namespace ReflectAR
             if (g.neck == Neckline.HoodDown)                                     // rolled hood lying on the upper back
             {
                 Vector3 q = p - new Vector3(0, s.L + 0.02f * u, -0.075f * u);
-                q = Quaternion.Euler(-35f, 0, 0) * q;
+                float ca = Mathf.Cos(-35f * Mathf.Deg2Rad), sa = Mathf.Sin(-35f * Mathf.Deg2Rad);
+                q = new Vector3(q.x, ca * q.y - sa * q.z, sa * q.y + ca * q.z);           // rotate about X (worker-thread safe)
                 float ring = new Vector2(new Vector2(q.x, q.z).magnitude - 0.105f * u, q.y).magnitude - 0.045f * u;
                 ring = Mathf.Max(ring, p.z - (0.01f * u));                        // back half only
                 body = SMin(body, ring, 0.03f * u);
@@ -242,8 +245,9 @@ namespace ReflectAR
         }
 
         // ---------------------------------------------------------------- build
-        public static GarmentMeshData Build(RestSkeleton s, GarmentSpec g)
+        public static GarmentMeshData Build(RestSkeleton s, GarmentSpec g, float cell = DefaultCell)
         {
+            Cell = cell;
             var c = new Ctx { s = s, g = g, e = g.ease * s.u, hemY = g.hem * s.L, neckR = 0.068f * s.u };
             c.lEnd = SleeveEnd(s, -1, g.sleeve, out c.lDir, out c.lLong);
             c.rEnd = SleeveEnd(s, +1, g.sleeve, out c.rDir, out c.rLong);

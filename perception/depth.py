@@ -15,9 +15,11 @@ STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
 class MonoDepth:
-    def __init__(self, backend, max_hz=12.0):
+    def __init__(self, backend, max_hz=12.0, idle_hz=0.5):
         self.model = backend.load("depth", "depth")
         self.min_period = 1.0 / max_hz if max_hz > 0 else 0.0
+        self.idle_period = 1.0 / idle_hz if idle_hz > 0 else self.min_period
+        self.active = True                 # set by the main loop: is someone being tracked?
         self._frame = None
         self._lock = threading.Lock()
         self.depth = None                  # (IN_H, IN_W) metres from camera
@@ -37,7 +39,8 @@ class MonoDepth:
             if f is None:
                 time.sleep(0.003)
                 continue
-            wait = self.min_period - (time.time() - self.stamp)
+            # nobody in view: only refresh occasionally (each run costs real power)
+            wait = (self.min_period if self.active else self.idle_period) - (time.time() - self.stamp)
             if wait > 0:
                 time.sleep(wait)
                 with self._lock:                     # use the newest frame after the wait

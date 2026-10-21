@@ -63,7 +63,6 @@ def main():
     img = np.zeros((540, 960, 3), np.uint8)
     img[:] = (60, 50, 45)
     cv2.putText(img, "SYNTHETIC FEED", (300, 280), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (200, 200, 200), 3)
-    jpg = cv2.imencode(".jpg", img)[1].tobytes()
     t0, seq, prog = time.time(), 0, 0.0
     while True:
         now = time.time()
@@ -91,7 +90,7 @@ def main():
                "cam": {**K.as_dict(), "pos": cfg["camera_pose"]["pos_m"], "tilt": 0.0}, "screen": cfg["screen"],
                "predict": cfg.get("predict", {}),
                "proc_fps": 30.0, "depth_hz": 0.0, "scale": 1.0, "z_skel": d, "z_da": 0.0}
-        net.push(msg, (now, jpg) if seq % 30 == 0 else None)
+        net.push(msg, (now, img) if seq % 30 == 0 else None)   # Streamer resizes + sends it raw
         seq += 1
         time.sleep(1 / 30)
 

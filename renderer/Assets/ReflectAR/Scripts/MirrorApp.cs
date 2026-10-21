@@ -54,8 +54,10 @@ namespace ReflectAR
 
         void Start()
         {
+            // Frame pacing: vsync would render at the panel rate (120 Hz on ProMotion) for 30 Hz
+            // tracking; cap at 60 fps while someone is tracked and 30 fps when idle (Update).
+            QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = 60;
-            QualitySettings.vSyncCount = 1;
             Screen.sleepTimeout = SleepTimeout.NeverSleep;
 
             client = gameObject.AddComponent<TrackingClient>();
@@ -166,13 +168,31 @@ namespace ReflectAR
         }
 
         // ------------------------------------------------------------------ frame
+        // frame-time stats, logged every 3 s (worst frame, cloth cost, mesh rebuilds)
+        float statT, statWorst, statSum, statCloth; int statN, statRebuilds;
+
+        void LogStats()
+        {
+            float dt = Time.unscaledDeltaTime;
+            statWorst = Mathf.Max(statWorst, dt); statSum += dt; statN++;
+            var cg = garments[current];
+            statCloth = Mathf.Max(statCloth, cg.LastStepMs);
+            if (Time.realtimeSinceStartup - statT < 3f) return;
+            int rb = 0; foreach (var gg in garments) rb += gg.RebuildCount;
+            Debug.Log($"[ReflectAR stats] avg {statN / statSum:0} fps, worst frame {statWorst * 1000:0} ms, " +
+                      $"cloth max {statCloth:0.0} ms, rebuilds +{rb - statRebuilds} (last {cg.LastBuildMs:0} ms), verts {cg.VertexCount}");
+            statT = Time.realtimeSinceStartup; statWorst = statSum = statCloth = 0; statN = 0; statRebuilds = rb;
+        }
+
         void Update()
         {
+            LogStats();
             client.Poll();
             HandleInput();
             var f = client.Latest;
             bool fresh = client.Connected && f != null && Time.time - client.LastFrameTime < 0.5f;
             bool tracked = fresh && f.tracked;
+            Application.targetFrameRate = tracked || visible > 0f ? 60 : 30;
             if (tracked)
             {
                 // Mirror: the real reflection has no delay, so aim for the moment this frame is on
@@ -197,6 +217,7 @@ namespace ReflectAR
             keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, zs));
             if (fillLight != null) fillLight.transform.rotation = Quaternion.LookRotation(new Vector3(-0.7f, -0.2f, zs));
 
+            if (body.Valid) foreach (var gg in garments) gg.Prepare();   // background builds, so swiping never waits
             var g = garments[current];
             g.Alpha = visible;
             g.gameObject.SetActive(visible > 0.001f);

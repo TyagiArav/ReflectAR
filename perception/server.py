@@ -4,9 +4,11 @@ Webcam -> BlazePose (OpenVINO) + metric mono depth -> 3D joints/eye in the
 Mirror frame -> gestures + range check -> TCP stream to Unity.
 
 Wire format (TCP, Python is the server, Unity connects):
-    1 byte type ('J' = JSON tracking frame, 'I' = camera image)
+    1 byte type ('J' = JSON tracking frame, 'R' = raw camera image, 'M' = person mask)
     4 byte big-endian payload length
-    payload: 'J' = UTF-8 JSON; 'I' = 8-byte big-endian float64 capture time + JPEG;
+    payload: 'J' = UTF-8 JSON; 'R' = 8-byte big-endian float64 capture time + uint16 width +
+                   uint16 height + RGB24 pixels (rows bottom first, ready for a texture upload). Raw over localhost costs far
+                   less CPU than a JPEG encode here plus a decode on Unity's main thread;
              'M' = float64 capture time + uint16 width + uint16 height + person mask
                    (uint8, rows top first, 255 = person) used to trim the occlusion proxy
 
@@ -140,12 +142,12 @@ class Streamer:
                     t_m, m = mask
                     conn.sendall(b"M" + struct.pack(">IdHH", m.size + 12, t_m, m.shape[1], m.shape[0]) + m.tobytes())
                 if img is not None:
-                    t_img, jpg = img
-                    if not isinstance(jpg, bytes):
-                        h, w = jpg.shape[:2]
-                        small = cv2.resize(jpg, (self.jpeg_w, int(h * self.jpeg_w / w)), interpolation=cv2.INTER_AREA)
-                        jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_q])[1].tobytes()
-                    conn.sendall(b"I" + struct.pack(">Id", len(jpg) + 8, t_img) + jpg)
+                    t_img, frame = img
+                    h, w = frame.shape[:2]
+                    fw, fh = self.jpeg_w, int(h * self.jpeg_w / w)
+                    small = cv2.resize(frame, (fw, fh), interpolation=cv2.INTER_AREA)
+                    rgb = cv2.cvtColor(cv2.flip(small, 0), cv2.COLOR_BGR2RGB).tobytes()   # bottom row first, like a Unity texture
+                    conn.sendall(b"R" + struct.pack(">IdHH", len(rgb) + 12, t_img, fw, fh) + rgb)
             except OSError:
                 print("[net] renderer disconnected")
                 with self.lock:
@@ -274,7 +276,8 @@ def main():
     warmup(pose.det, (1, DET_SIZE, DET_SIZE, 3)); warmup(pose.lm, (1, LM_SIZE, LM_SIZE, 3))
     warmup(hand_model.model, (1, HAND_SIZE, HAND_SIZE, 3))
     hands = HandWorker(hand_model)
-    depth = MonoDepth(backend, max_hz=depth_model_hz)
+    depth = MonoDepth(backend, max_hz=depth_model_hz, idle_hz=comp.get("depth_idle_hz", 0.5))
+    idle_fps = comp.get("idle_pose_fps", 6.0)
     warmup(depth.model, (1, 3, IN_H, IN_W))
     print(backend.summary())
     print(f"[backend] devices {backend.devices}, CPU threads {backend.threads}, depth capped at "
@@ -301,8 +304,13 @@ def main():
 
     fps, pose_ms, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, 0.0, ""
     last_da = (None, -1e9)
+    last_idle_run = 0.0
     while True:
         frame, stamp, seq = cam.read(seq)
+        # nobody in view for a while: only look for a person a few times a second
+        if stamp - last_seen > 3.0 and stamp - last_idle_run < 1.0 / idle_fps:
+            continue
+        last_idle_run = stamp
         t0 = time.time()
         t_cap = stamp - cam_lat
         depth.submit(frame)
@@ -382,6 +390,7 @@ def main():
             if stamp - last_seen > 1.0:
                 f_joints.reset(); f_eye.reset(); f_dist.reset()
 
+        depth.active = stamp - last_seen < 3.0
         dt = time.time() - t0
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)

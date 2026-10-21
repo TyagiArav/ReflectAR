@@ -95,7 +95,9 @@ namespace ReflectAR
         Thread thread;
         readonly object gate = new object();
         TrackingFrame pendingFrame;
-        byte[] pendingJpeg, pendingMask;
+        byte[] pendingJpeg, pendingMask, pendingRaw;
+        double pendingRawT;
+        int pendingRawW, pendingRawH;
         double pendingJpegT, pendingMaskT;
         int pendingMaskW, pendingMaskH;
 
@@ -164,6 +166,19 @@ namespace ReflectAR
                                 Buffer.BlockCopy(body, 8, jpg, 0, len - 8);
                                 lock (gate) { pendingJpeg = jpg; pendingJpegT = BitConverter.ToDouble(tb, 0); }
                             }
+                            else if (header[0] == (byte)'R' && len > 12)
+                            {
+                                // capture time (float64), width, height (uint16), then RGB24 rows bottom first.
+                                // Raw over localhost: no JPEG encode in perception, no decode on our main thread.
+                                var tb = new byte[8];
+                                Buffer.BlockCopy(body, 0, tb, 0, 8);
+                                if (BitConverter.IsLittleEndian) Array.Reverse(tb);
+                                int w = (body[8] << 8) | body[9], h = (body[10] << 8) | body[11];
+                                if (w * h * 3 != len - 12) continue;
+                                var px = new byte[w * h * 3];
+                                Buffer.BlockCopy(body, 12, px, 0, px.Length);
+                                lock (gate) { pendingRaw = px; pendingRawT = BitConverter.ToDouble(tb, 0); pendingRawW = w; pendingRawH = h; }
+                            }
                             else if (header[0] == (byte)'M' && len > 12)
                             {
                                 // capture time (float64), width, height (uint16), then uint8 rows, top first
@@ -202,13 +217,17 @@ namespace ReflectAR
         public void Poll()
         {
             TrackingFrame f;
-            byte[] jpg, mask;
+            byte[] jpg, mask, raw;
+            double rawT;
+            int rawW, rawH;
             double jpgT, maskT;
             int maskW, maskH;
             lock (gate)
             {
                 f = pendingFrame; pendingFrame = null;
                 jpg = pendingJpeg; pendingJpeg = null;
+                raw = pendingRaw; pendingRaw = null;
+                rawT = pendingRawT; rawW = pendingRawW; rawH = pendingRawH;
                 jpgT = pendingJpegT;
                 mask = pendingMask; pendingMask = null;
                 maskT = pendingMaskT; maskW = pendingMaskW; maskH = pendingMaskH;
@@ -232,6 +251,13 @@ namespace ReflectAR
             {
                 Feed.LoadImage(jpg, false);
                 FeedCaptureTime = jpgT + clockOffset;
+            }
+            if (raw != null && offsetCount > 0)
+            {
+                if (Feed.width != rawW || Feed.height != rawH) Feed.Reinitialize(rawW, rawH, TextureFormat.RGB24, false);
+                Feed.LoadRawTextureData(raw);
+                Feed.Apply(false);
+                FeedCaptureTime = rawT + clockOffset;
             }
             if (mask != null && offsetCount > 0)
             {

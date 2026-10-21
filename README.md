@@ -24,7 +24,7 @@ The system has two programs that talk over a local TCP socket:
 | **Python 3.11+** | The perception service and its tools |
 | **ONNX Runtime** | Runs the neural networks on the best device available: **Core ML** (Apple Neural Engine or GPU) on Macs, **TensorRT / CUDA** on NVIDIA GPUs, **DirectML** on other Windows GPUs (`backend.py`) |
 | **OpenVINO** | CPU inference. It's used whenever a model runs on the CPU, because it's about 1.6× faster there than ONNX Runtime's CPU path |
-| **OpenCV** (`opencv-python`) | Webcam capture, image warping, JPEG encoding, checkerboard calibration |
+| **OpenCV** (`opencv-python`) | Webcam capture, image warping and resizing, checkerboard calibration |
 | **NumPy** | All geometry, filtering and tensor pre/post-processing |
 | **MediaPipe BlazePose (full)** | Body detection, 33-joint landmarks and the person segmentation mask. MediaPipe's ROI tracking is re-implemented in `blazepose.py`, so the MediaPipe package itself is **not** needed |
 | **MediaPipe Hand Landmarker** | Fist detection on a crop around the raised wrist |
@@ -57,6 +57,7 @@ All model files are already committed in `perception/models/`, in two forms: `.o
 ReflectAR/
 ├── run_perception.sh            # starts the perception service (macOS / Linux)
 ├── run_perception.bat           # starts the perception service (Windows)
+├── run_mirror.sh                # macOS: perception + the standalone app (lowest CPU / battery)
 ├── perception/
 │   ├── requirements.txt         # Python dependencies, with the right runtime per platform
 │   ├── server.py                # main service: webcam → tracking → TCP stream
@@ -180,6 +181,8 @@ Startup prints a `[backend] …` line saying which device each model runs on, a 
 
 **2. Start the renderer:** in Unity, with `ReflectAR.unity` open, press **Play**.
 
+**Lowest CPU / battery (macOS):** build the app once (Unity: *File > Build Profiles > macOS*, output `renderer/Builds/ReflectAR.app`), then run `./run_mirror.sh`. It starts perception and the app together, and stops perception when you quit the app with **Esc**. The Unity Editor redraws its own windows every frame: in Play mode it measured 85–220 % CPU against ~55 % for the app.
+
 Stand **1–3 m** from the screen. Outside that range a prompt shows ("Please step back" / "Come a little closer"), garments dim, and gestures are disabled.
 
 ### Useful `server.py` flags
@@ -189,7 +192,7 @@ Stand **1–3 m** from the screen. Outside that range a prompt shows ("Please st
 | `--log` | Print tracking state every second, plus a `[swipe?] … reject` line explaining every rejected swipe |
 | `--snapshot dbg.jpg` | Write an annotated debug frame every second |
 | `--video file.mp4` | Replay a recording instead of the webcam |
-| `--no-image` | Don't stream camera JPEGs to Unity |
+| `--no-image` | Don't stream the camera image to Unity |
 | `--calib-dist <m>` | Distance calibration (see below); exits when done |
 | `--ep-log` | Show how much of each model Core ML / TensorRT took and what fell back to the CPU |
 | `--config <path>` | Use a different config file (default `calib/config.json`) |
@@ -247,16 +250,16 @@ Absolute distance from one camera is approximate (±10–20 %). Fusion helps, bu
 
 - **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because Unity doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
 - **Pose:** the stock MediaPipe BlazePose *full* detector and landmark models, with MediaPipe's ROI tracking re-implemented (`blazepose.py`). Each joint's 3D position comes from back-projecting its 2D pixel at a fused distance, plus BlazePose's relative per-joint depth, so the skeleton always lands exactly on the person in the image (`geometry.py`, `server.py`).
-- **Depth from one camera:** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 12 Hz (`compute.depth_max_hz`) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
+- **Depth from one camera:** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 2 Hz (`compute.depth_max_hz`; 0.5 Hz when nobody is in view) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
 - **Gestures:** `gestures.py`. A swipe is the wrist crossing ≥ 0.9 shoulder-widths horizontally within 0.9 s, measured on the raw 2D image relative to the shoulders, so it's independent of distance and has no filter lag. Arcing strokes are fine as long as horizontal motion dominates, and blurry frames are tolerated. With `--log`, every candidate stroke prints a `[swipe?] … reject` line with the reason. Fist = MediaPipe hand-landmark model on a crop around the raised wrist (`handpose.py`), with finger-curl ratios. A fist held still blocks swipes.
-- **Latency / pose prediction:** perception sends each frame's joints *with velocities* at the frame's capture time (`filters.PosePredictor`: One-Euro at rest, a constant-velocity Kalman filter once a joint moves). Every render frame, `TrackingClient.Predict` extrapolates them to the moment that frame reaches the screen, so the garment sits on where the body is now, not where it was ~80 ms ago, and moves at the render rate rather than in 30 Hz steps. In *CameraFeed* mode the overlay is instead matched to the capture time of the image shown under it. Clocks are synced from each frame's send time. Measured end to end with a known trajectory and 60 ms latency: fast-motion error halves (110 → 55 mm), slow motion −20 %, rest jitter < 1 mm/frame. The rest of the pipeline was cut too: JSON goes out before the JPEG (now encoded on the network thread), the fist classifier runs on its own thread, and pose and depth get separate OpenVINO thread budgets. Together these took capture→Unity from 141 ms to 19 ms on a 4-core test box. Tuning lives in `predict`, `filters` and `camera.latency_s` in `calib/config.json`. Debug line (D) shows latency and prediction horizon.
+- **Latency / pose prediction:** perception sends each frame's joints *with velocities* at the frame's capture time (`filters.PosePredictor`: One-Euro at rest, a constant-velocity Kalman filter once a joint moves). Every render frame, `TrackingClient.Predict` extrapolates them to the moment that frame reaches the screen, so the garment sits on where the body is now, not where it was ~80 ms ago, and moves at the render rate rather than in 30 Hz steps. In *CameraFeed* mode the overlay is instead matched to the capture time of the image shown under it. Clocks are synced from each frame's send time. Measured end to end with a known trajectory and 60 ms latency: fast-motion error halves (110 → 55 mm), slow motion −20 %, rest jitter < 1 mm/frame. The rest of the pipeline was cut too: JSON goes out before the camera image, the fist classifier runs on its own thread, and pose and depth get separate OpenVINO thread budgets. Together these took capture→Unity from 141 ms to 19 ms on a 4-core test box. Tuning lives in `predict`, `filters` and `camera.latency_s` in `calib/config.json`. Debug line (D) shows latency and prediction horizon.
 - **Occlusion (`BodyProxy.cs`, `ReflectAR_DepthOnly.shader`):** depth-only stand-ins for the body hide whatever of the garment is behind it. Parts under the garment (torso, neck, sleeved arm) are fitted capsules. Exposed parts (bare forearms, hands with fingers, head with hair) are drawn oversized, then trimmed per pixel to the person mask that BlazePose's landmark model produces (sent with each frame, `net.mask_width`): each fragment is projected into the camera image and dropped where the mask says there is no person, so the cut-out follows the real silhouette. The lookup uses where that body part was when the mask was captured, so prediction doesn't tear it, and it works in both modes. Oversized parts are pushed back by their oversize so they can't poke through sleeves or the collar. On the test clip it covers 99 % of the real hands, forearms and head (capsules alone: 87 %), and occluder pixels off the body drop from 35 % to 7 %. B shows the proxies (trimmed parts tinted warm).
-- **Wire format:** TCP, with Python as the server. Each message is 1 type byte, a 4-byte big-endian length, then the payload: `J` = JSON tracking frame; `I` = float64 capture time + JPEG; `M` = float64 capture time + uint16 width + uint16 height + the person mask (uint8, 255 = person).
+- **Wire format:** TCP, with Python as the server. Each message is 1 type byte, a 4-byte big-endian length, then the payload: `J` = JSON tracking frame; `R` = float64 capture time + uint16 width + uint16 height + RGB24 camera image (rows bottom first); `M` = float64 capture time + uint16 width + uint16 height + the person mask (uint8, 255 = person). Unity still accepts the older `I` (float64 capture time + JPEG). The image goes raw because on one machine that's far cheaper than a JPEG encode plus a decode on Unity's main thread.
 - **Render pipelines (`HdrpLook.cs`, `GarmentMaterials.cs`):** the scene is set up at runtime for whichever pipeline is active. Under **HDRP**, garments are `HDRP/Lit` (opaque, double-sided) with per-fabric base colour, weave normal map and mask map (AO in the weave's valleys, smoothness per fibre: fleece 0.1, denim 0.2, nylon 0.5–0.6). They get a 3000 lux key light with soft shadows (6° angular diameter), a 700 lux fill, ambient from a soft gradient "room", SSAO and contact shadows. The body proxies cast shadows and are in the depth buffer, so hands, arms and the head shade the garment. Fixed exposure (EV100 10) and neutral tonemapping; the feed and proxy shaders divide the exposure back out, so the camera image keeps its brightness. SMAA instead of TAA (cloth has no motion vectors, so TAA would smear it), and no bloom or dithering, so black stays black on the mirror. While a garment fades in or out it switches to a transparent copy of its material. Under **URP** everything renders as before with the `ReflectAR/Garment` triplanar shader.
   - In HDRP the camera feed is drawn after the depth prepass, so it can't show through the proxies' depth; the proxies' colour pass draws the feed pixel they cover instead (`ReflectAR_DepthOnly.shader`).
-- **Renderer:** `MirrorApp.cs` has two modes. *CameraFeed* places a virtual camera at the webcam pose with its intrinsics, mirrored, over the live JPEG feed. *Mirror* renders the reflected `MirrorWorld` with a Kooima off-axis frustum from the tracked eye; this is the mode the two-way-mirror build will use.
+- **Renderer:** `MirrorApp.cs` has two modes. *CameraFeed* places a virtual camera at the webcam pose with its intrinsics, mirrored, over the live camera feed. *Mirror* renders the reflected `MirrorWorld` with a Kooima off-axis frustum from the tracked eye; this is the mode the two-way-mirror build will use.
 - **Garments (upper body only):** 10 tops in `GarmentCatalog.cs`: tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer, tank.
-  - *Body shape* (`BodyShape.cs`): the torso is measured from the person mask at six heights between the hips and the shoulders. It walks the mask outward from the torso's centre line to the silhouette edge, then averages the ratio to the generic body over ~1.5 s into `BodyRig.Profile`. A side is skipped while its arm touches the torso (that edge would be the arm), so it measures whenever an arm is away from the body, for example while swiping. Nothing is measured unless the user faces the camera (±25°). Wider also means deeper (60 % of the width change), for chest and belly. Garments rebuild when a level changes by more than 5 %.
+  - *Body shape* (`BodyShape.cs`): the torso is measured from the person mask at six heights between the hips and the shoulders. It walks the mask outward from the torso's centre line to the silhouette edge, then averages the ratio to the generic body over ~1.5 s into `BodyRig.Profile`. A side is skipped while its arm touches the torso (that edge would be the arm), so it measures whenever an arm is away from the body, for example while swiping. Nothing is measured unless the user faces the camera (±25°). Wider also means deeper (60 % of the width change), for chest and belly. Garments rebuild in the background when a level changes by more than 8 % for 1.5 s.
   - *Mesh* (`GarmentMesher.cs`): each garment is generated per user as one seamless surface. A signed-distance field smoothly blends the torso, shoulders, sleeves and collar, so armpits and shoulders have no gaps. It is meshed with surface nets and cut open at the neck, hem and cuffs. The torso cross-section follows the measured body plus ease. Below the chest it hangs from whatever is widest above it (chest or belly) by `fit` (tank 0.15, tee 0.75, hoodie 0.95), the way fabric falls instead of tucking into the waist. Ribbed hem bands (hoodie, bomber, puffer) pull back in to the hips, and gathered cuffs sit at the wrist with the sleeve bloused over them; both hold to the body in the cloth sim.
   - *UV layout*: the surface is laid out like sewn pattern pieces: front and back panels unrolled around the torso (side seams), a yoke over the shoulder tops, and each sleeve unrolled around the arm (seam underneath). Texture stretch on the tee, flannel and hoodie: median 1.0, 90th percentile ≤ 1.45, area scale within ±8 % for 90 % of the surface. Vertices are split along the seams only for drawing; the solver keeps the welded mesh, and normals come from it, so seams don't show in the shading.
   - *Closures* (`GarmentTrims.cs`): real geometry that rides on the cloth. A raised placket with sewn buttons (polo 2, flannel 8, denim with metal shanks), or a zipper with tape, teeth, slider and pull (bomber, puffer). It hangs off a chain of points found by ray down the centre front of the rest mesh; each point follows its triangle on the simulated cloth and carries a local frame, so the closure bends with the fabric.
@@ -264,6 +267,26 @@ Absolute distance from one camera is approximate (±10–20 %). Fusion helps, bu
   - *Shading*: HDRP as above. URP (`ReflectAR_Garment.shader`): seamless triplanar fabric anchored to the rest pose, so patterns stick to the cloth, with sheen and weave shading. The solver costs ~6 ms per frame in the Editor (Release code optimization).
 
 ---
+
+## Performance and battery
+
+Measured on an M5 Pro while tracking one person (CPU, 100 % = one core). The "before" figures are from the OpenVINO-only build:
+
+| | Before | After |
+|---|---|---|
+| Perception | ~970 % | ~120–170 % on the CPU; less with Core ML, which puts the models on the Neural Engine |
+| Renderer | 85–220 % (Editor, Play mode) | ~55 % (standalone app) |
+| Worst frame | up to 533 ms (garment rebuild on the main thread) | ~22 ms |
+
+What made the difference:
+- **Depth model:** runs at 2 Hz (`compute.depth_max_hz`), and 0.5 Hz with nobody in view (`depth_idle_hz`). It only feeds the user distance, which is smoothed at < 1 Hz.
+- **CPU thread budgets:** 2 threads each for pose and depth when they run on the CPU (`pose_threads`, `depth_threads`); big pools spin and burn power for ~1 ms of latency.
+- **Idle mode:** with nobody in view for 3 s, person detection drops to 6 fps (`idle_pose_fps`).
+- **Camera image:** sent raw over localhost instead of as JPEG.
+- **Garment meshes:** built on a worker thread and pre-built for all 10 garments once someone is tracked. A rebuild needs a sustained change in the user's measurements (3 s cooldown while the profile settles, then 10 s), because each rebuild resets the cloth.
+- **Cloth:** mesh detail scales with body size and is capped at 4,000 vertices. The cloth inherits 90 % of the body's motion each frame, so 2 substeps are enough and it doesn't trail behind the user.
+- **Frame rate:** capped at 60 fps while tracking and 30 fps when idle, with vsync off (a 120 Hz panel would otherwise render 120 fps).
+- **Diagnostics:** Unity logs `[ReflectAR stats]` every 3 s with fps, worst frame, cloth cost and rebuild count.
 
 ## Troubleshooting
 

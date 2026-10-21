@@ -18,28 +18,65 @@
   },
   "camera_pose": {
     "_note": "Camera optical centre in Mirror frame (metres) and downward pitch. Laptop camera sits ~8 mm above the active area, centred.",
-    "pos_m": [0.151, 0.204, 0.0],
+    "pos_m": [
+      0.151,
+      0.204,
+      0.0
+    ],
     "tilt_down_deg": 0.0
   },
-  "range_m": [1.0, 3.0],
+  "range_m": [
+    1.0,
+    3.0
+  ],
   "depth": {
     "_note": "Weight of the Depth Anything metric estimate vs the BlazePose skeleton-scale estimate when fusing user distance.",
     "fusion_weight": 0.7,
-    "torso_surface_offset_m": 0.10
+    "torso_surface_offset_m": 0.1
   },
   "compute": {
-    "_note": "backend: auto (ONNX Runtime if installed, else OpenVINO) | onnx | openvino. *_device: auto | ane (Apple Neural Engine) | gpu (Apple GPU, NVIDIA TensorRT/CUDA, DirectML) | cpu. auto = ane on Macs, gpu with NVIDIA, else cpu. *_threads: CPU inference thread budgets, 0 = auto (depth half the cores). Depth is capped because the distance it feeds is smoothed at < 1 Hz.",
+    "_note": "backend: auto (ONNX Runtime if installed, else OpenVINO) | onnx | openvino. *_device: auto | ane (Apple Neural Engine) | gpu (Apple GPU, NVIDIA TensorRT/CUDA, DirectML) | cpu. auto = ane on Macs, gpu with NVIDIA, else cpu. *_threads: CPU inference thread budgets (only used when a model runs on the CPU), 0 = auto (depth half the cores). Kept small: big pools burn battery for ~1 ms. Depth is capped because the distance it feeds is smoothed at < 1 Hz; depth_idle_hz applies when nobody is tracked.",
     "backend": "auto",
     "pose_device": "auto",
     "depth_device": "auto",
-    "pose_threads": 0,
-    "depth_threads": 0,
-    "depth_max_hz": 12.0
+    "pose_threads": 2,
+    "depth_threads": 2,
+    "depth_max_hz": 2.0,
+    "depth_idle_hz": 0.5,
+    "idle_pose_fps": 6.0
   },
   "filters": {
     "_note": "PosePredictor: One-Euro at rest, constant-velocity Kalman (accel_std, m/s^2) once the smoothed speed passes gate_speed (m/s). meas_std = landmark noise per Mirror axis (m).",
-    "joints": {"mincutoff": 1.2, "beta": 0.8, "accel_std": 25.0, "gate_accel_std": 2.0, "gate_speed": [0.1, 0.35], "meas_std": [0.004, 0.004, 0.02]},
-    "eye": {"mincutoff": 1.0, "beta": 0.5, "accel_std": 25.0, "gate_accel_std": 2.0, "gate_speed": [0.1, 0.35], "meas_std": [0.004, 0.004, 0.02]},
+    "joints": {
+      "mincutoff": 1.2,
+      "beta": 0.8,
+      "accel_std": 25.0,
+      "gate_accel_std": 2.0,
+      "gate_speed": [
+        0.1,
+        0.35
+      ],
+      "meas_std": [
+        0.004,
+        0.004,
+        0.02
+      ]
+    },
+    "eye": {
+      "mincutoff": 1.0,
+      "beta": 0.5,
+      "accel_std": 25.0,
+      "gate_accel_std": 2.0,
+      "gate_speed": [
+        0.1,
+        0.35
+      ],
+      "meas_std": [
+        0.004,
+        0.004,
+        0.02
+      ]
+    },
     "scale_ema": 0.05
   },
   "predict": {
@@ -66,6 +103,12 @@
     "fist_gap_tolerance_s": 0.5,
     "fist_max_drift_m": 0.15
   },
-  "net": {"host": "127.0.0.1", "port": 5566, "jpeg_width": 960, "jpeg_quality": 75,
-          "_mask_note": "person-mask width sent to Unity for occlusion (0 = off)", "mask_width": 256}
+  "net": {
+    "host": "127.0.0.1",
+    "port": 5566,
+    "jpeg_width": 960,
+    "jpeg_quality": 75,
+    "_mask_note": "person-mask width sent to Unity for occlusion (0 = off)",
+    "mask_width": 256
+  }
 }
