@@ -37,6 +37,7 @@ namespace ReflectAR
         public CamInfo cam;
         public ScreenInfo screen;
         public float proc_fps, depth_hz, scale, z_skel, z_da, lat_ms, cam_fps;
+        public float[] shape;    // measured half-widths (m): hip, waist, chest, shoulder, upper-arm radius; 0 = not seen
     }
 
     /// <summary>
@@ -62,7 +63,8 @@ namespace ReflectAR
         Thread thread;
         readonly object gate = new object();
         TrackingFrame pendingFrame;
-        byte[] pendingJpeg;
+        byte[] pendingFeed;
+        int pendingW, pendingH;
 
         public static Vector3 MirrorToUnity(float x, float y, float z) => new Vector3(x, y, -z);
 
@@ -105,9 +107,13 @@ namespace ReflectAR
                                 if (f.events != null) foreach (var e in f.events) Events.Enqueue(e);
                                 lock (gate) pendingFrame = f;
                             }
-                            else if (header[0] == (byte)'I')
+                            else if (header[0] == (byte)'R')
                             {
-                                lock (gate) pendingJpeg = body;
+                                // raw RGB frame: 2-byte width, 2-byte height, then pixels (top row first)
+                                int w = (body[0] << 8) | body[1], h = (body[2] << 8) | body[3];
+                                var px = new byte[w * h * 3];
+                                Buffer.BlockCopy(body, 4, px, 0, px.Length);
+                                lock (gate) { pendingFeed = px; pendingW = w; pendingH = h; }
                             }
                         }
                     }
@@ -134,13 +140,19 @@ namespace ReflectAR
         void Update()
         {
             TrackingFrame f;
-            byte[] jpg;
+            byte[] feed; int fw, fh;
             lock (gate)
             {
                 f = pendingFrame; pendingFrame = null;
-                jpg = pendingJpeg; pendingJpeg = null;
+                feed = pendingFeed; pendingFeed = null; fw = pendingW; fh = pendingH;
             }
-            if (jpg != null) Feed.LoadImage(jpg, false);
+            if (feed != null)
+            {
+                // raw upload: no JPEG decode on the main thread
+                if (Feed.width != fw || Feed.height != fh) Feed.Reinitialize(fw, fh, TextureFormat.RGB24, false);
+                Feed.LoadRawTextureData(feed);
+                Feed.Apply(false);
+            }
             if (f == null) return;
             Latest = f;
             LastFrameTime = Time.time;

@@ -39,11 +39,14 @@ namespace ReflectAR
         float visible;           // 0..1 garment fade
         bool hadBody;
         float lastTracked = -10f;
+        int lastShapeSeq = -1;
 
         void Start()
         {
+            // Frame pacing: no vsync (on a 120 Hz ProMotion display it would render 120 fps for
+            // 30 Hz tracking); 60 fps while someone is tracked, 30 fps when idle (set in Update).
+            QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = 60;
-            QualitySettings.vSyncCount = 1;
             Screen.sleepTimeout = SleepTimeout.NeverSleep;
 
             client = gameObject.AddComponent<TrackingClient>();
@@ -75,7 +78,7 @@ namespace ReflectAR
             feedQuad = new GameObject("CameraFeed", typeof(MeshFilter), typeof(MeshRenderer));
             feedMesh = new Mesh { name = "FeedQuad" };
             feedMesh.SetVertices(new Vector3[4]);
-            feedMesh.SetUVs(0, new[] { new Vector2(0, 1), new Vector2(1, 1), new Vector2(1, 0), new Vector2(0, 0) });
+            feedMesh.SetUVs(0, new[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) });  // raw rows are top-first
             feedMesh.SetTriangles(new[] { 0, 1, 2, 0, 2, 3 }, 0);
             feedQuad.GetComponent<MeshFilter>().sharedMesh = feedMesh;
             feedQuad.GetComponent<MeshRenderer>().sharedMaterial = feedMat;
@@ -160,9 +163,13 @@ namespace ReflectAR
             var f = client.Latest;
             bool fresh = client.Connected && f != null && Time.time - client.LastFrameTime < 0.5f;
             bool tracked = fresh && f.tracked;
+            Application.targetFrameRate = tracked || visible > 0f ? 60 : 30;
             if (tracked)
             {
+                bool newPerson = !hadBody || Time.time - lastTracked > 3f;
+                if (newPerson) body.ResetShape();
                 body.Update(client.Joints, client.Visibility, Time.deltaTime, !hadBody || Time.time - lastTracked > 0.5f);
+                if (f.seq != lastShapeSeq && f.shape != null && f.range == "ok") { body.AddShape(f.shape); lastShapeSeq = f.seq; }
                 hadBody = true;
                 lastTracked = Time.time;
             }
@@ -336,9 +343,15 @@ namespace ReflectAR
             if (!on) return;
             mat.SetFloat("_ColorMask", debugVisible ? 15f : 0f);
             for (int i = 0; i < Limbs.Length; i++)
-                Place(parts[i], b.J[Limbs[i].a], b.J[Limbs[i].b], Limbs[i].r * b.Unit, Limbs[i].r * b.Unit, b.Fwd);
+            {
+                float r = Limbs[i].r * b.Unit;
+                if (i < 4 && b.Shape[BodyRig.ShapeArm] > 0f) r = b.Shape[BodyRig.ShapeArm] * (i < 2 ? 0.8f : 0.65f);   // measured arm, inside the sleeve
+                Place(parts[i], b.J[Limbs[i].a], b.J[Limbs[i].b], r, r, b.Fwd);
+            }
             int k = Limbs.Length;
-            Place(parts[k], b.HipC, b.ShC, b.ShoulderW * 0.42f, 0.095f * b.Unit, b.Fwd);                     // torso
+            // torso proxy sits well inside the garment: it only has to hide cloth that is behind the body
+            float torsoHalfW = b.Shape[BodyRig.ShapeChest] > 0f ? b.Shape[BodyRig.ShapeChest] * 0.8f : b.ShoulderW * 0.36f;
+            Place(parts[k], b.HipC, b.ShC, torsoHalfW, 0.072f * b.Unit, b.Fwd);                                  // torso
             Place(parts[k + 1], b.ShC, b.HeadC - b.Up * 0.05f * b.Unit, 0.05f * b.Unit, 0.05f * b.Unit, b.Fwd);                  // neck
             parts[k + 2].localPosition = b.HeadC; parts[k + 2].localRotation = b.ChestRot;
             parts[k + 2].localScale = new Vector3(b.HeadR * 1.9f, b.HeadR * 2.3f, b.HeadR * 2.1f);    // head

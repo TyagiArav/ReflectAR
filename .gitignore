@@ -30,3 +30,4 @@ renderer/*.mdb
 renderer/*.apk
 renderer/*.aab
 renderer/crashlytics-build.properties
+renderer/Assets/Screenshots/

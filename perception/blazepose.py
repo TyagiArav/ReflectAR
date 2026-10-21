@@ -51,9 +51,12 @@ def roi_from_points(p_center, p_top, scale=1.25):
 
 
 class BlazePose:
-    def __init__(self, core: ov.Core, model_dir="models", device="CPU"):
-        self.det = core.compile_model(f"{model_dir}/pose_detection.tflite", device)
-        self.lm = core.compile_model(f"{model_dir}/pose_landmark_full.tflite", device)
+    def __init__(self, core: ov.Core, model_dir="models", device="CPU", threads=2):
+        # A small fixed thread count: by default OpenVINO grabs every core and keeps the pool
+        # spinning, which doubles CPU (and battery) per inference for ~1 ms of latency.
+        cfg = {"INFERENCE_NUM_THREADS": threads, "NUM_STREAMS": 1, "PERFORMANCE_HINT": "LATENCY"}
+        self.det = core.compile_model(f"{model_dir}/pose_detection.tflite", device, cfg)
+        self.lm = core.compile_model(f"{model_dir}/pose_landmark_full.tflite", device, cfg)
         self.det_req = self.det.create_infer_request()
         self.lm_req = self.lm.create_infer_request()
         self.anchors = _gen_anchors()

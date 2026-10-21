@@ -63,7 +63,8 @@ def main():
     img = np.zeros((540, 960, 3), np.uint8)
     img[:] = (60, 50, 45)
     cv2.putText(img, "SYNTHETIC FEED", (300, 280), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (200, 200, 200), 3)
-    jpg = cv2.imencode(".jpg", img)[1].tobytes()
+    import struct
+    jpg = struct.pack(">HH", img.shape[1], img.shape[0]) + cv2.cvtColor(img, cv2.COLOR_BGR2RGB).tobytes()
     t0, seq, prog = time.time(), 0, 0.0
     while True:
         t = time.time() - t0

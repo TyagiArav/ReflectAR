@@ -8,6 +8,7 @@ namespace ReflectAR
     public struct RestSkeleton
     {
         public float L, sw, hipW, u, upperL, upperR, foreL, foreR;
+        public float mHip, mWaist, mChest, mShoulder, mArm;   // measured half-widths / arm radius (0 = unknown)
         public Vector3 hipC, shC, lSh, rSh, lEl, rEl, lWr, rWr;
         public const float ArmDropDeg = 40f;
 
@@ -17,6 +18,8 @@ namespace ReflectAR
             {
                 L = b.TorsoLen, sw = b.ShoulderW, hipW = b.HipW, u = b.Unit,
                 upperL = b.UpperL, upperR = b.UpperR, foreL = b.ForeL, foreR = b.ForeR,
+                mHip = b.Shape[BodyRig.ShapeHip], mWaist = b.Shape[BodyRig.ShapeWaist], mChest = b.Shape[BodyRig.ShapeChest],
+                mShoulder = b.Shape[BodyRig.ShapeShoulder], mArm = b.Shape[BodyRig.ShapeArm],
             };
             r.hipC = Vector3.zero;
             r.shC = new Vector3(0, r.L, 0);
@@ -37,8 +40,11 @@ namespace ReflectAR
         public void TorsoRadii(float y, out float a, out float d)
         {
             float t = y / L;
-            float hipA = hipW * 0.68f + 0.02f * u, chestA = sw * 0.5f * 0.9f;
-            float waistA = Mathf.Lerp(hipA, chestA, 0.45f) * 0.93f;
+            // measured silhouette where we have it, average proportions otherwise
+            float hipA = mHip > 0 ? mHip : hipW * 0.68f + 0.02f * u;
+            float chestA = mChest > 0 ? mChest : sw * 0.5f * 0.9f;
+            if (mHip <= 0 && mChest > 0) hipA = chestA * 0.95f;
+            float waistA = mWaist > 0 ? mWaist : Mathf.Lerp(hipA, chestA, 0.45f) * 0.93f;
             a = Pw(t, new[] { -0.3f, 0f, 0.3f, 0.7f, 1f }, new[] { hipA * 1.04f, hipA, waistA, chestA, chestA * 0.92f });
             d = Pw(t, new[] { -0.3f, 0f, 0.3f, 0.7f, 1f }, new[] { 0.11f, 0.105f, 0.098f, 0.108f, 0.075f }) * u;
         }
@@ -68,7 +74,10 @@ namespace ReflectAR
     /// </summary>
     public static class GarmentMesher
     {
-        const float Cell = 0.017f;
+        // Voxel size of the build; set per call (thread-static, since builds run on worker threads).
+        [System.ThreadStatic] static float Cell;
+        public const float DefaultCell = 0.017f;
+        public const float EaseScale = 0.55f;
 
         // ---------------------------------------------------------------- SDF helpers
         static float SMin(float a, float b, float k)
@@ -112,7 +121,10 @@ namespace ReflectAR
             a += e; d += e;
             float torso = (Mathf.Sqrt(p.x * p.x / (a * a) + p.z * p.z / (d * d)) - 1f) * Mathf.Min(a, d);
             torso = SMax(torso, p.y - (s.L - 0.02f * u), 0.05f * u);
-            float shoulders = Capsule(p, s.lSh + Vector3.up * 0.005f, s.rSh + Vector3.up * 0.005f, 0.058f * u + e, 0.058f * u + e);
+            // shoulder cap: its outer edge lands on the measured shoulder silhouette (+ ease)
+            float rS = 0.05f * u + e * 0.5f;
+            float shX = s.mShoulder > 0 ? Mathf.Max(s.mShoulder + e - rS, s.sw * 0.3f) : s.sw * 0.5f;
+            float shoulders = Capsule(p, new Vector3(-shX, s.L + 0.005f, 0), new Vector3(shX, s.L + 0.005f, 0), rS, rS);
             float body = SMin(torso, shoulders, 0.07f * u);
             // neck band rising slightly above the shoulders (collar base)
             float bandTop = g.neck == Neckline.Collar ? 0.075f * u : 0.025f * u;
@@ -134,12 +146,13 @@ namespace ReflectAR
             }
             else if (g.sleeve > 0f)
             {
-                float se = g.sleeveEase * u;
+                float se = g.sleeveEase * u * EaseScale;
                 for (int side = -1; side <= 1; side += 2)
                 {
                     Vector3 sh = side < 0 ? s.lSh : s.rSh, end = side < 0 ? c.lEnd : c.rEnd, dir = side < 0 ? c.lDir : c.rDir;
                     Vector3 start = sh - Vector3.right * side * 0.03f * u + Vector3.up * 0.01f * u;
-                    float r0 = 0.062f * u + se, r1 = Mathf.Lerp(r0, 0.043f * u + se, g.sleeve) + g.cuffFlare * u;
+                    float armR = s.mArm > 0 ? s.mArm : 0.05f * u;                      // measured upper-arm radius
+                    float r0 = armR * 1.1f + se, r1 = Mathf.Lerp(r0, armR * 0.8f + se, g.sleeve) + g.cuffFlare * u;
                     float arm = Capsule(p, start, end, r0, r1);
                     arm = Mathf.Max(arm, Vector3.Dot(p - end, dir));             // flat cuff
                     body = SMin(body, arm, 0.06f * u);
@@ -170,9 +183,12 @@ namespace ReflectAR
         }
 
         // ---------------------------------------------------------------- build
-        public static GarmentMeshData Build(RestSkeleton s, GarmentSpec g)
+        public static GarmentMeshData Build(RestSkeleton s, GarmentSpec g, float cell = DefaultCell)
         {
-            var c = new Ctx { s = s, g = g, e = g.ease * s.u, hemY = g.hem * s.L, neckR = 0.068f * s.u };
+            Cell = cell;
+            // ease is applied on top of the measured silhouette (which already includes the user's
+            // own clothes), so only a fraction of the nominal garment ease is needed
+            var c = new Ctx { s = s, g = g, e = g.ease * s.u * EaseScale, hemY = g.hem * s.L, neckR = 0.068f * s.u };
             c.lEnd = SleeveEnd(s, -1, g.sleeve, out c.lDir, out c.lLong);
             c.rEnd = SleeveEnd(s, +1, g.sleeve, out c.rDir, out c.rLong);
 

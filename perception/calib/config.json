@@ -65,5 +65,14 @@
     "port": 5566,
     "jpeg_width": 960,
     "jpeg_quality": 75
+  },
+  "perf": {
+    "_note": "CPU/battery budget. depth only feeds the smoothed user distance, so a few Hz is enough.",
+    "depth_hz": 2.0,
+    "depth_idle_hz": 0.5,
+    "depth_threads": 2,
+    "pose_threads": 2,
+    "hand_threads": 2,
+    "idle_pose_fps": 6.0
   }
 }

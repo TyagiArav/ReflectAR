@@ -4,7 +4,7 @@ Webcam -> BlazePose (OpenVINO) + metric mono depth -> 3D joints/eye in the
 Mirror frame -> gestures + range check -> TCP stream to Unity.
 
 Wire format (TCP, Python is the server, Unity connects):
-    1 byte type ('J' = JSON tracking frame, 'I' = JPEG camera image)
+    1 byte type ('J' = JSON tracking frame, 'R' = raw RGB camera frame: u16 width, u16 height, pixels)
     4 byte big-endian payload length
     payload
 
@@ -21,6 +21,7 @@ from depth import MonoDepth
 from filters import OneEuro
 from geometry import Intrinsics, skeleton_distance, CameraToMirror
 from gestures import Gestures, SIDES
+from silhouette import measure as measure_silhouette
 
 L_EYE, R_EYE = 2, 5
 TORSO = (11, 12, 23, 24)
@@ -113,7 +114,7 @@ class Streamer:
                 self.json_msg, self.jpeg = None, None
             try:
                 if jpg is not None:
-                    conn.sendall(b"I" + struct.pack(">I", len(jpg)) + jpg)
+                    conn.sendall(b"R" + struct.pack(">I", len(jpg)) + jpg)
                 body = json.dumps(msg, separators=(",", ":")).encode()
                 conn.sendall(b"J" + struct.pack(">I", len(body)) + body)
             except OSError:
@@ -201,9 +202,12 @@ def main():
 
     core = ov.Core()
     core.set_property("CPU", {"CACHE_DIR": "models/cache"})
-    pose = BlazePose(core)
-    hands = HandPose(core)
-    depth = MonoDepth(core)
+    perf = cfg.get("perf", {})
+    pose = BlazePose(core, threads=perf.get("pose_threads", 2))
+    hands = HandPose(core, threads=perf.get("hand_threads", 2))
+    depth = MonoDepth(core, hz=perf.get("depth_hz", 3.0), idle_hz=perf.get("depth_idle_hz", 0.5),
+                      threads=perf.get("depth_threads", 2))
+    idle_fps = perf.get("idle_pose_fps", 6.0)
     cc = cfg["camera"]
     cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("fps", 30))
     frame, _, seq = cam.read(0)
@@ -225,8 +229,13 @@ def main():
     jpeg_w, jpeg_q = cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"]
     fps, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, ""
     cam_fps, last_stamp = 30.0, time.time()
+    last_idle_run, depth_runs, depth_t = 0.0, 0, time.time()
     while True:
         frame, stamp, seq = cam.read(seq)
+        # nobody in view for a while: only look for a person a few times a second
+        if stamp - last_seen > 3.0 and stamp - last_idle_run < 1.0 / idle_fps:
+            continue
+        last_idle_run = stamp
         t0 = time.time()
         depth.submit(frame)
         res = pose(frame)
@@ -279,6 +288,11 @@ def main():
                     if roi is not None:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if rgb is None else rgb
                         fists[side] = is_fist(hands(rgb, roi))
+            # actual body widths from the segmentation mask (cheap; a few times a second is plenty)
+            if seq % 5 == 0:
+                sil = measure_silhouette(res["seg"], res["seg_affine"], uv, vis)
+                to_m = z_root / K.fx
+                msg["shape"] = [round(sil.get(k, 0.0) * to_m, 4) for k in ("hip", "waist", "chest", "shoulder", "arm")]
             msg.update(tracked=True, range=rng(dist), dist=dist,
                        joints=np.round(P_m, 4).ravel().tolist(),
                        vis=np.round(vis, 3).tolist(),
@@ -297,11 +311,14 @@ def main():
             gest.reset()
             if stamp - last_seen > 1.0:
                 f_joints.reset(); f_eye.reset(); f_dist.reset()
+        depth.active = stamp - last_seen < 3.0
 
         jpg = None
-        if not args.no_image:
-            small = cv2.resize(frame, (jpeg_w, int(H * jpeg_w / W)), interpolation=cv2.INTER_AREA)
-            jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])[1].tobytes()
+        if not args.no_image and net.connected:          # nobody watching: skip the JPEG encode
+            # Raw RGB over localhost (~1.5 MB/frame) is far cheaper than JPEG encode here + decode in Unity.
+            fw_, fh_ = jpeg_w, int(H * jpeg_w / W)
+            small = cv2.resize(frame, (fw_, fh_), interpolation=cv2.INTER_AREA)
+            jpg = struct.pack(">HH", fw_, fh_) + cv2.cvtColor(small, cv2.COLOR_BGR2RGB).tobytes()
         dt = time.time() - t0
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
@@ -316,6 +333,8 @@ def main():
             print(f"[swipe?] {gest.debug}")
         last_dbg = gest.debug
         if args.log and stamp - t_log > 1.0:
+            depth.hz = (depth.runs - depth_runs) / max(time.time() - depth_t, 1e-3)
+            depth_runs, depth_t = depth.runs, time.time()
             t_log = stamp
             print(f"[state] tracked={msg['tracked']} range={msg['range']} dist={msg['dist']:.2f} "
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "

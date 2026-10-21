@@ -9,6 +9,10 @@ renderer/    Unity 6000.6 (URP)         off-axis / webcam-intrinsics camera, pro
 
 ## Run
 
+**Efficient way (recommended):** `./run_mirror.sh` starts perception and the standalone app (`renderer/Builds/ReflectAR.app`). It uses roughly 2 CPU cores in total, versus 3–4 with the Unity Editor in Play mode. Rebuild the app after changing Unity code.
+
+**For development:**
+
 1. Grant camera access to the app you launch from (System Settings → Privacy & Security → Camera). Turn **Center Stage off**: it crops the image and changes the focal length.
 2. `./run_perception.sh`, which adds `--log` by default. Add `--snapshot /tmp/dbg.jpg` to write an annotated debug frame every second.
 3. Open `renderer/` in Unity, open `Assets/ReflectAR/ReflectAR.unity`, and press Play. The mirror UI waits for perception and connects on its own.
@@ -33,9 +37,29 @@ The user must stand **1–3 m** from the screen. Outside that range a prompt sho
 - **Gestures:** `gestures.py`. A swipe is the wrist crossing ≥ 0.9 shoulder-widths horizontally within 0.9 s, measured on the raw 2D image relative to the shoulders, so it's independent of distance and has no filter lag. Arcing strokes are fine as long as horizontal motion dominates, and blurry frames are tolerated. With `--log`, every candidate stroke prints a `[swipe?] … reject` line with the reason. Fist = MediaPipe hand-landmark model on a crop around the raised wrist (`handpose.py`), with finger-curl ratios. A fist held still blocks swipes.
 - **Renderer:** `MirrorApp.cs` has two modes. *CameraFeed* places a virtual camera at the webcam pose with its intrinsics, mirrored, over the live JPEG feed. *Mirror* renders the reflected `MirrorWorld` with a Kooima off-axis frustum from the tracked eye; this is the mode the two-way-mirror build will use.
 - **Garments (upper body only):** 10 tops in `GarmentCatalog.cs`: tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer, tank.
+  - *Fit:* perception measures your silhouette from BlazePose's segmentation mask (`silhouette.py`): torso half-width at hip, waist, chest and shoulder, plus upper-arm radius, with hanging arms excluded. Unity takes a robust median of recent readings and sizes every garment from it. Before this, sizes came from average-person proportions and the clothes looked too big.
   - *Mesh* (`GarmentMesher.cs`): each garment is generated per user as one seamless surface. A signed-distance field smoothly blends the torso, shoulders, sleeves and collar, so armpits and shoulders have no gaps. It is meshed with surface nets and cut open at the neck, hem and cuffs.
   - *Physics* (`ClothGarment.cs`): an XPBD cloth solver, with near-inextensible stretch, soft compression so the fabric buckles into wrinkles, and bending, gravity, inertia and damping. It collides with capsules fitted to the body. The cloth is tethered to a version of the mesh skinned to six tracked bones; the tether is ~0 at the collar and shoulders and grows toward the hem and cuffs. Fabric parameters (denim stiff, jersey soft, puffer thick) are per garment.
   - *Shading* (`ReflectAR_Garment.shader`): seamless triplanar fabric anchored to the rest pose, so patterns stick to the cloth. It adds sheen, weave shading, and procedural zippers and button plackets. The solver costs ~6 ms per frame in the Editor (Release code optimization).
+
+## Performance and battery
+
+Measured on the M5 Pro while tracking one person:
+
+| | Before | After |
+|---|---|---|
+| Perception | ~970 % CPU | ~120–170 % |
+| Renderer | ~115 % (Editor) | ~55 % (standalone app) |
+
+What made the difference:
+- **Depth model:** runs at 2 Hz (0.5 Hz with nobody in view) instead of continuously. It costs ~0.3 s of CPU per run and only feeds the smoothed distance.
+- **OpenVINO threads:** each model is limited to 2 threads; the default pools spin across every core.
+- **Idle mode:** person detection drops to 6 fps after 3 s with nobody in view.
+- **Camera feed:** sent to Unity as raw RGB, with no JPEG encode/decode.
+- **Cloth:** mesh resolution scales with body size and is capped at 4k vertices; 2 solver substeps.
+- **Frame rate:** Unity is capped at 60 fps while tracking and 30 fps when idle, with no vsync (a 120 Hz screen would otherwise render 120 fps).
+
+Settings live in `perception/calib/config.json` → `perf`.
 
 ## Calibration
 

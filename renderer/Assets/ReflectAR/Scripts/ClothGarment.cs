@@ -16,7 +16,8 @@ namespace ReflectAR
     {
         public GarmentSpec spec;
         public BodyRig body;
-        public int substeps = 3;
+        public int substeps = 2;                     // cloth inherits body motion (follow), so 2 is enough
+        const int MaxVerts = 4000;
         [Range(0, 1)] public float follow = 0.9f;  // share of body motion the cloth inherits directly
 
         public float Alpha { get; set; } = 1f;
@@ -89,9 +90,14 @@ namespace ReflectAR
                     || d(body.ForeL, built.foreL) > 0.3f || d(body.ForeR, built.foreR) > 0.3f;
                 // only a sustained change in the user's proportions (new person, or measurements
                 // settling) is worth a rebuild; tracking jitter is not
+                // the measured silhouette arrives (or changes noticeably): refit soon
+                float bc = body.Shape[BodyRig.ShapeChest];
+                bool shapeNew = bc > 0f && (built.mChest <= 0f || d(bc, built.mChest) > 0.12f
+                    || d(body.Shape[BodyRig.ShapeArm], Mathf.Max(built.mArm, 1e-3f)) > 0.2f && body.Shape[BodyRig.ShapeArm] > 0f);
                 if (!drift) driftSince = -1f;
                 else if (driftSince < 0f) driftSince = Time.time;
-                rebuild = drift && Time.time - driftSince > 2f && Time.time - lastApplied > 10f;
+                rebuild = (drift && Time.time - driftSince > 2f && Time.time - lastApplied > 10f)
+                       || (shapeNew && Time.time - lastApplied > (built.mChest <= 0f ? 0.5f : 8f));
             }
             if (!rebuild) return;
             var skel = RestSkeleton.From(body);
@@ -102,7 +108,13 @@ namespace ReflectAR
         static Built Generate(RestSkeleton skel, GarmentSpec spec)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var r = new Built { skel = skel, data = GarmentMesher.Build(skel, spec) };
+            // Mesh detail is relative to the body (same look for every user) and capped, because
+            // solver cost grows with vertex count: ~4k vertices keeps it to a few ms per frame.
+            float cell = GarmentMesher.DefaultCell * Mathf.Max(skel.u, 0.8f);
+            var data = GarmentMesher.Build(skel, spec, cell);
+            if (data.rest.Length > MaxVerts)
+                data = GarmentMesher.Build(skel, spec, cell * Mathf.Sqrt(data.rest.Length / (MaxVerts * 0.9f)));
+            var r = new Built { skel = skel, data = data };
             int n = r.data.rest.Length;
             r.maxDist = new float[n]; r.skinK = new float[n];
             for (int i = 0; i < n; i++)

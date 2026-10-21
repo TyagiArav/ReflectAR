@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace ReflectAR
@@ -46,6 +47,35 @@ namespace ReflectAR
         /// <summary>Body-relative unit: 1 for a 0.36 m shoulder-joint span. Garment and proxy
         /// dimensions scale with it, so the overlay fits even if absolute distance is off.</summary>
         public float Unit => ShoulderW / 0.36f;
+
+        // ---- measured silhouette (from the segmentation mask), robust median over recent readings
+        public const int ShapeHip = 0, ShapeWaist = 1, ShapeChest = 2, ShapeShoulder = 3, ShapeArm = 4;
+        readonly List<float>[] shapeSamples = { new List<float>(), new List<float>(), new List<float>(), new List<float>(), new List<float>() };
+        public readonly float[] Shape = new float[5];        // 0 = unknown
+        public bool ShapeReady => Shape[ShapeChest] > 0f;
+
+        public void AddShape(float[] m)
+        {
+            if (m == null || m.Length < 5) return;
+            for (int i = 0; i < 5; i++)
+            {
+                if (m[i] <= 0f) continue;
+                var l = shapeSamples[i];
+                l.Add(m[i]);
+                if (l.Count > 40) l.RemoveAt(0);
+                if (l.Count >= 8)
+                {
+                    var sorted = new List<float>(l); sorted.Sort();
+                    Shape[i] = sorted[sorted.Count / 2];
+                }
+            }
+        }
+
+        public void ResetShape()
+        {
+            foreach (var l in shapeSamples) l.Clear();
+            System.Array.Clear(Shape, 0, Shape.Length);
+        }
 
         public Quaternion ChestRot => Quaternion.LookRotation(Fwd, Up);
         public Quaternion PelvisRot => Quaternion.LookRotation(PFwd, Up);
