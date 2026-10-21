@@ -32,6 +32,33 @@ def _gen_anchors():
     return np.array(anchors, np.float32)
 
 
+def pick_closest(raw, anchors, scores, thresh=0.5, iou_max=0.3):
+    """Index of the person to track: the largest one in the image (= closest to the mirror),
+    not the most confident one, which in a busy room is often someone in the background.
+    Overlapping detections of the same person are merged first (non-max suppression)."""
+    idx = np.where(scores >= thresh)[0]
+    if idx.size == 0:
+        return None
+    idx = idx[np.argsort(-scores[idx])]
+    c = raw[idx, 0:2] / DET_SIZE + anchors[idx]
+    wh = raw[idx, 2:4] / DET_SIZE
+    lo, hi = c - wh / 2, c + wh / 2
+    keep = []
+    for i in range(idx.size):
+        ok = True
+        for j in keep:
+            inter = np.prod(np.clip(np.minimum(hi[i], hi[j]) - np.maximum(lo[i], lo[j]), 0, None))
+            union = np.prod(wh[i]) + np.prod(wh[j]) - inter
+            if inter / max(union, 1e-9) > iou_max:
+                ok = False
+                break
+        if ok:
+            keep.append(i)
+    # body scale: hip centre -> point above the head (keypoints 0 and 1)
+    size = [np.linalg.norm(raw[idx[i], 6:8] - raw[idx[i], 4:6]) for i in keep]
+    return int(idx[keep[int(np.argmax(size))]])
+
+
 def roi_affine(center, side, rot, out):
     """2x3 matrix mapping output-crop pixels -> image pixels."""
     c, s = math.cos(rot), math.sin(rot)
@@ -66,8 +93,8 @@ class BlazePose:
         res = self.det(inp[None])
         raw = res[0][0]
         scores = sigmoid(res[1][0, :, 0])
-        best = int(np.argmax(scores))
-        if scores[best] < 0.5:
+        best = pick_closest(raw, self.anchors, scores)
+        if best is None:
             return None
         r, a = raw[best], self.anchors[best]
         kp0 = (r[4:6] / DET_SIZE + a) * s - (padx, pady)
