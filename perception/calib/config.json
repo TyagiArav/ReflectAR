@@ -1,11 +1,13 @@
 {
   "camera": {
     "index": 0,
+    "api": "auto",
     "width": 1280,
     "height": 720,
     "hfov_deg": 70.0,
     "intrinsics_file": "calib/intrinsics.json",
-    "fps": 60
+    "_latency_note": "Exposure -> frame-delivered delay. A frame's capture time = read time - latency_s. Fine-tune by eye with [ / ] in Unity's Mirror mode.",
+    "latency_s": 0.04
   },
   "screen": {
     "_note": "Active display area of the 14in MacBook Pro (3024x1964 @ 254 ppi). Mirror-frame origin = lower-left corner.",
@@ -32,16 +34,57 @@
     "fusion_weight": 0.7,
     "torso_surface_offset_m": 0.1
   },
+  "compute": {
+    "_note": "backend: auto (ONNX Runtime if installed, else OpenVINO) | onnx | openvino. *_device: auto | ane (Apple Neural Engine) | gpu (Apple GPU, NVIDIA TensorRT/CUDA, DirectML) | cpu. auto = ane on Macs, gpu with NVIDIA, else cpu. *_threads: CPU inference thread budgets (only used when a model runs on the CPU), 0 = auto (depth half the cores). Kept small: big pools burn battery for ~1 ms. Depth is capped because the distance it feeds is smoothed at < 1 Hz; depth_idle_hz applies when nobody is tracked.",
+    "backend": "auto",
+    "pose_device": "auto",
+    "depth_device": "auto",
+    "pose_threads": 2,
+    "depth_threads": 2,
+    "depth_max_hz": 2.0,
+    "depth_idle_hz": 0.5,
+    "idle_pose_fps": 6.0
+  },
   "filters": {
+    "_note": "PosePredictor: One-Euro at rest, constant-velocity Kalman (accel_std, m/s^2) once the smoothed speed passes gate_speed (m/s). meas_std = landmark noise per Mirror axis (m).",
     "joints": {
-      "mincutoff": 1.5,
-      "beta": 8.0
+      "mincutoff": 1.2,
+      "beta": 0.8,
+      "accel_std": 25.0,
+      "gate_accel_std": 2.0,
+      "gate_speed": [
+        0.1,
+        0.35
+      ],
+      "meas_std": [
+        0.004,
+        0.004,
+        0.02
+      ]
     },
     "eye": {
-      "mincutoff": 1.5,
-      "beta": 6.0
+      "mincutoff": 1.0,
+      "beta": 0.5,
+      "accel_std": 25.0,
+      "gate_accel_std": 2.0,
+      "gate_speed": [
+        0.1,
+        0.35
+      ],
+      "meas_std": [
+        0.004,
+        0.004,
+        0.02
+      ]
     },
     "scale_ema": 0.05
+  },
+  "predict": {
+    "_note": "Sent to Unity, which extrapolates the pose to each rendered frame's display time: x + v*tau*(1-exp(-h/tau)), h <= max_horizon_s. blend_tc_s eases the hand-over when a new perception frame arrives.",
+    "display_latency_s": 0.025,
+    "horizon_tau_s": 0.35,
+    "max_horizon_s": 0.25,
+    "blend_tc_s": 0.015
   },
   "gestures": {
     "_note": "swipe distances are in shoulder widths (sw) in the 2D image, so they don't depend on distance",
@@ -64,15 +107,8 @@
     "host": "127.0.0.1",
     "port": 5566,
     "jpeg_width": 960,
-    "jpeg_quality": 75
-  },
-  "perf": {
-    "_note": "CPU/battery budget. depth only feeds the smoothed user distance, so a few Hz is enough.",
-    "depth_hz": 2.0,
-    "depth_idle_hz": 0.5,
-    "depth_threads": 2,
-    "pose_threads": 2,
-    "hand_threads": 2,
-    "idle_pose_fps": 6.0
+    "jpeg_quality": 75,
+    "_mask_note": "person-mask width sent to Unity for occlusion (0 = off)",
+    "mask_width": 256
   }
 }

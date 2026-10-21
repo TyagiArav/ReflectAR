@@ -14,6 +14,9 @@ namespace ReflectAR
     /// Mirror: what the two-way-mirror build needs. Black background, garments placed on the
     ///   reflected body (MirrorWorld scale z = -1), rendered with an off-axis frustum from the
     ///   tracked eye through the physical screen rectangle.
+    ///
+    /// Runs under URP or HDRP (ReflectAR > Render Pipeline menu). HDRP adds physically based
+    /// fabric (HDRP/Lit with weave normal maps), soft shadows, SSAO and contact shadows (HdrpLook).
     /// </summary>
     public class MirrorApp : MonoBehaviour
     {
@@ -21,17 +24,26 @@ namespace ReflectAR
         public bool showProxy;
         public bool showDebug = true;
         public bool cubeTest;
+        [Tooltip("Extrapolate the pose to when each frame reaches the screen (P toggles, for A/B).")]
+        public bool predict = true;
+        [Tooltip("Extra prediction lead (ms) on top of config.json's latencies, Mirror mode. Tune with [ and ].")]
+        public float leadMs;
+        [Tooltip("Trim the hands / bare arms / head occluders to perception's person mask (O toggles, for A/B).")]
+        public bool trimToMask = true;
 
         TrackingClient client;
         Camera cam;
         Transform mirrorWorld;
         readonly BodyRig body = new BodyRig();
+        readonly BodyShape shape = new BodyShape();
         ClothGarment[] garments;
         GarmentSpec[] specs;
         BodyProxy proxy;
+        readonly Vector3[] maskJoints = new Vector3[33];
         MirrorUI ui;
         GameObject feedQuad, cube;
-        Light keyLight;
+        Light keyLight, fillLight;
+        bool hdrp;
         Mesh feedMesh;
         Material feedMat;
 
@@ -39,12 +51,11 @@ namespace ReflectAR
         float visible;           // 0..1 garment fade
         bool hadBody;
         float lastTracked = -10f;
-        int lastShapeSeq = -1;
 
         void Start()
         {
-            // Frame pacing: no vsync (on a 120 Hz ProMotion display it would render 120 fps for
-            // 30 Hz tracking); 60 fps while someone is tracked, 30 fps when idle (set in Update).
+            // Frame pacing: vsync would render at the panel rate (120 Hz on ProMotion) for 30 Hz
+            // tracking; cap at 60 fps while someone is tracked and 30 fps when idle (Update).
             QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = 60;
             Screen.sleepTimeout = SleepTimeout.NeverSleep;
@@ -57,8 +68,13 @@ namespace ReflectAR
             cam.farClipPlane = 20f;
 
             mirrorWorld = new GameObject("MirrorWorld").transform;
+            hdrp = RenderLook.HDRP;
+            if (hdrp)
+            {
+                HdrpLook.SetupCamera(cam);
+                HdrpLook.CreateVolume();
+            }
 
-            var garmentMat = new Material(Shader.Find("ReflectAR/Garment"));
             specs = GarmentCatalog.All;
             garments = new ClothGarment[specs.Length];
             for (int i = 0; i < specs.Length; i++)
@@ -66,19 +82,19 @@ namespace ReflectAR
                 var go = new GameObject("Garment_" + specs[i].name, typeof(MeshFilter), typeof(MeshRenderer));
                 go.transform.SetParent(mirrorWorld, false);
                 var g = go.AddComponent<ClothGarment>();
-                g.Init(specs[i], body, garmentMat);
+                g.Init(specs[i], body);
                 go.SetActive(false);
                 garments[i] = g;
             }
             garments[current].gameObject.SetActive(true);
 
-            proxy = new BodyProxy(mirrorWorld, new Material(Shader.Find("ReflectAR/DepthOnly")));
+            proxy = new BodyProxy(mirrorWorld, new Material(Shader.Find("ReflectAR/DepthOnly")), hdrp);
 
             feedMat = new Material(Shader.Find("ReflectAR/Feed"));
             feedQuad = new GameObject("CameraFeed", typeof(MeshFilter), typeof(MeshRenderer));
             feedMesh = new Mesh { name = "FeedQuad" };
             feedMesh.SetVertices(new Vector3[4]);
-            feedMesh.SetUVs(0, new[] { new Vector2(0, 0), new Vector2(1, 0), new Vector2(1, 1), new Vector2(0, 1) });  // raw rows are top-first
+            feedMesh.SetUVs(0, new[] { new Vector2(0, 1), new Vector2(1, 1), new Vector2(1, 0), new Vector2(0, 0) });
             feedMesh.SetTriangles(new[] { 0, 1, 2, 0, 2, 3 }, 0);
             feedQuad.GetComponent<MeshFilter>().sharedMesh = feedMesh;
             feedQuad.GetComponent<MeshRenderer>().sharedMaterial = feedMat;
@@ -87,11 +103,19 @@ namespace ReflectAR
             Destroy(cube.GetComponent<Collider>());
             cube.name = "CubeTest";
             cube.transform.localScale = Vector3.one * 0.2f;
-            cube.GetComponent<MeshRenderer>().sharedMaterial = new Material(garmentMat);
+            cube.GetComponent<MeshRenderer>().sharedMaterial = GarmentMaterials.Plain(new Color(0.8f, 0.8f, 0.8f));
             cube.SetActive(false);
 
             keyLight = FindAnyObjectByType<Light>();
-            if (keyLight != null)
+            if (keyLight == null) keyLight = new GameObject("KeyLight").AddComponent<Light>();
+            if (hdrp)
+            {
+                // key with soft shadows, plus a dim fill from the other side so shadowed folds aren't black
+                HdrpLook.SetupLight(keyLight, HdrpLook.KeyLux, true, 6f);
+                fillLight = new GameObject("FillLight").AddComponent<Light>();
+                HdrpLook.SetupLight(fillLight, HdrpLook.FillLux, false, 0f);
+            }
+            else
             {
                 keyLight.type = LightType.Directional;
                 keyLight.intensity = 1.1f;
@@ -114,6 +138,10 @@ namespace ReflectAR
                 if (kb.bKey.wasPressedThisFrame) showProxy = !showProxy;
                 if (kb.dKey.wasPressedThisFrame) showDebug = !showDebug;
                 if (kb.cKey.wasPressedThisFrame) cubeTest = !cubeTest;
+                if (kb.pKey.wasPressedThisFrame) { predict = !predict; ui.Toast(predict ? "Prediction on" : "Prediction off"); }
+                if (kb.oKey.wasPressedThisFrame) { trimToMask = !trimToMask; ui.Toast(trimToMask ? "Occlusion: person mask" : "Occlusion: capsules only"); }
+                if (kb.leftBracketKey.wasPressedThisFrame) leadMs -= 5f;
+                if (kb.rightBracketKey.wasPressedThisFrame) leadMs += 5f;
                 if (kb.escapeKey.wasPressedThisFrame) Application.Quit();
             }
             while (client.Events.TryDequeue(out var e))
@@ -147,18 +175,19 @@ namespace ReflectAR
         {
             float dt = Time.unscaledDeltaTime;
             statWorst = Mathf.Max(statWorst, dt); statSum += dt; statN++;
-            var g = garments[current];
-            statCloth = Mathf.Max(statCloth, g.LastStepMs);
+            var cg = garments[current];
+            statCloth = Mathf.Max(statCloth, cg.LastStepMs);
             if (Time.realtimeSinceStartup - statT < 3f) return;
             int rb = 0; foreach (var gg in garments) rb += gg.RebuildCount;
             Debug.Log($"[ReflectAR stats] avg {statN / statSum:0} fps, worst frame {statWorst * 1000:0} ms, " +
-                      $"cloth max {statCloth:0.0} ms, rebuilds +{rb - statRebuilds} (last {g.LastBuildMs:0} ms), verts {g.VertexCount}");
+                      $"cloth max {statCloth:0.0} ms, rebuilds +{rb - statRebuilds} (last {cg.LastBuildMs:0} ms), verts {cg.VertexCount}");
             statT = Time.realtimeSinceStartup; statWorst = statSum = statCloth = 0; statN = 0; statRebuilds = rb;
         }
 
         void Update()
         {
             LogStats();
+            client.Poll();
             HandleInput();
             var f = client.Latest;
             bool fresh = client.Connected && f != null && Time.time - client.LastFrameTime < 0.5f;
@@ -166,34 +195,67 @@ namespace ReflectAR
             Application.targetFrameRate = tracked || visible > 0f ? 60 : 30;
             if (tracked)
             {
-                bool newPerson = !hadBody || Time.time - lastTracked > 3f;
-                if (newPerson) body.ResetShape();
+                // Mirror: the real reflection has no delay, so aim for the moment this frame is on
+                // screen. CameraFeed: match the (equally delayed) image under the overlay instead.
+                double now = TrackingClient.Now;
+                bool matchFeed = mode == ViewMode.CameraFeed && now - client.FeedCaptureTime < 0.5;
+                double target = matchFeed ? client.FeedCaptureTime : now + client.DisplayLatency + leadMs * 0.001;
+                client.Predict(target, predict, predict && !matchFeed);
+                if (!hadBody) shape.Reset(body);                 // a new person: measure them from scratch
                 body.Update(client.Joints, client.Visibility, Time.deltaTime, !hadBody || Time.time - lastTracked > 0.5f);
-                if (f.seq != lastShapeSeq && f.shape != null && f.range == "ok") { body.AddShape(f.shape); lastShapeSeq = f.seq; }
                 hadBody = true;
                 lastTracked = Time.time;
             }
             // hold the last pose 0.5 s, then fade over 0.3 s; dim while out of range
-            float target = !hadBody || Time.time - lastTracked > 0.5f ? 0f : (f != null && f.range == "ok" ? 1f : 0.35f);
-            visible = Mathf.MoveTowards(visible, target, Time.deltaTime / 0.3f);
+            float fadeTo = !hadBody || Time.time - lastTracked > 0.5f ? 0f : (f != null && f.range == "ok" ? 1f : 0.35f);
+            visible = Mathf.MoveTowards(visible, fadeTo, Time.deltaTime / 0.3f);
             if (visible <= 0f && Time.time - lastTracked > 0.8f) hadBody = false;
 
             mirrorWorld.localScale = mode == ViewMode.Mirror ? new Vector3(1, 1, -1) : Vector3.one;
             // key light from above, beside the screen, falling on the (real or reflected) front of the body
-            if (keyLight != null)
-                keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, mode == ViewMode.Mirror ? 1f : -1f));
+            float zs = mode == ViewMode.Mirror ? 1f : -1f;
+            keyLight.transform.rotation = Quaternion.LookRotation(new Vector3(0.55f, -0.6f, zs));
+            if (fillLight != null) fillLight.transform.rotation = Quaternion.LookRotation(new Vector3(-0.7f, -0.2f, zs));
 
-            if (body.Valid) foreach (var gg in garments) gg.Prepare();   // background, so swiping never waits
+            if (body.Valid) foreach (var gg in garments) gg.Prepare();   // background builds, so swiping never waits
             var g = garments[current];
             g.Alpha = visible;
             g.gameObject.SetActive(visible > 0.001f);
             if (body.Valid && visible > 0f) g.Step(Time.deltaTime);
-            proxy.Update(body, body.Valid && visible > 0f, showProxy);
+            bool maskFresh = tracked && client.Mask != null && TrackingClient.Now - client.MaskCaptureTime < 0.3;
+            bool maskOn = trimToMask && maskFresh;
+            if (maskFresh)
+            {
+                client.PoseAt(client.MaskCaptureTime, maskJoints);
+                // measure the user's build from the silhouette, a few times a second
+                if (f.range == "ok" && Time.frameCount % 4 == 0)
+                {
+                    Vector3 cp = CamPosMirror(f.cam);
+                    shape.Measure(client.MaskBytes, client.MaskWidth, client.MaskHeight, MaskMatrix(f.cam), maskJoints, body,
+                        new Vector3(cp.x, cp.y, -cp.z), Time.deltaTime * 4f);
+                }
+            }
+            if (maskOn)
+            {
+                Shader.SetGlobalTexture("_ReflectARMask", client.Mask);
+                Shader.SetGlobalFloat("_ReflectARMaskThreshold", 0.5f);
+            }
+            if (f != null && f.cam != null && f.cam.fx > 0)
+            {
+                Shader.SetGlobalMatrix("_ReflectARMaskMatrix", MaskMatrix(f.cam));
+                Shader.SetGlobalMatrix("_ReflectARWorldToBody", mirrorWorld.worldToLocalMatrix);
+            }
+            // HDRP: the proxies show the feed where they cover it (see ReflectAR_DepthOnly.shader)
+            bool feedOn = mode == ViewMode.CameraFeed && f != null && f.cam != null && f.cam.fx > 0;
+            Shader.SetGlobalTexture("_ReflectARFeed", client.Feed);
+            Shader.SetGlobalFloat("_ReflectARFeedOn", feedOn ? (f.range == "ok" || !f.tracked ? 1f : 0.6f) : 0f);
+            proxy.Update(body, body.Valid && visible > 0f, showProxy, specs[current].tank ? 0f : specs[current].sleeve, maskOn ? maskJoints : null);
             UpdateFeedQuad(f);
             cube.SetActive(cubeTest && mode == ViewMode.Mirror);
             if (cube.activeSelf && f != null && f.screen != null)
                 cube.transform.SetPositionAndRotation(new Vector3(f.screen.w_m / 2, f.screen.h_m / 2, 0.75f), Quaternion.Euler(20, 30, 0));
-            ui.Update(f, client.Connected, tracked, current, selected, mode, showDebug, cam, body);
+            string lat = $"latency {client.LatencyMs:0} ms  ·  prediction {(predict ? $"+{client.HorizonMs:0} ms" : "off")}  lead {leadMs:+0;-0} ms  [P] [ [ ] ]  ·  occlusion {(maskOn ? "person mask" : "capsules")} [O]";
+            ui.Update(f, client.Connected, tracked, current, selected, mode, showDebug, cam, body, lat);
         }
 
         void LateUpdate()
@@ -215,6 +277,16 @@ namespace ReflectAR
             tilt.SetRow(2, new Vector4(0, -Mathf.Sin(th), Mathf.Cos(th), 0));
             var flip = Matrix4x4.Scale(new Vector3(-1, -1, 1));
             return flip * tilt;
+        }
+
+        /// <summary>Body coords (Unity, unreflected) -> camera image (u / w, v / h) * depth, for the mask lookup.</summary>
+        static Matrix4x4 MaskMatrix(CamInfo ci)
+        {
+            var K = Matrix4x4.identity;
+            K.m00 = ci.fx / ci.w; K.m02 = ci.cx / ci.w;
+            K.m11 = ci.fy / ci.h; K.m12 = ci.cy / ci.h;
+            // Unity -> Mirror (z flip), Mirror -> camera (inverse of CamToMirror + position), intrinsics
+            return K * CamToMirror(ci).transpose * Matrix4x4.Translate(-CamPosMirror(ci)) * Matrix4x4.Scale(new Vector3(1, 1, -1));
         }
 
         static Vector3 CamPosMirror(CamInfo ci) => ci.pos != null && ci.pos.Length == 3 ? new Vector3(ci.pos[0], ci.pos[1], ci.pos[2]) : Vector3.zero;
@@ -289,79 +361,6 @@ namespace ReflectAR
             }
             feedMesh.SetVertices(v);
             feedMesh.RecalculateBounds();
-        }
-    }
-
-    /// <summary>Depth-only capsules standing in for the user's body (occlusion prepass).</summary>
-    public class BodyProxy
-    {
-        readonly Transform[] parts;
-        readonly Material mat;
-        static readonly (int a, int b, float r)[] Limbs =
-        {
-            (LM.LShoulder, LM.LElbow, 0.045f), (LM.RShoulder, LM.RElbow, 0.045f),
-            (LM.LElbow, LM.LWrist, 0.04f), (LM.RElbow, LM.RWrist, 0.04f),
-            (LM.LHip, LM.LKnee, 0.07f), (LM.RHip, LM.RKnee, 0.07f),
-            (LM.LKnee, LM.LAnkle, 0.055f), (LM.RKnee, LM.RAnkle, 0.055f),
-        };
-        // parts: limbs..., torso, neck, head, lhand, rhand
-
-        public BodyProxy(Transform parent, Material m)
-        {
-            mat = m;
-            var root = new GameObject("BodyProxy").transform;
-            root.SetParent(parent, false);
-            parts = new Transform[Limbs.Length + 5];
-            for (int i = 0; i < parts.Length; i++)
-            {
-                bool sphere = i >= Limbs.Length + 2;
-                var go = GameObject.CreatePrimitive(sphere ? PrimitiveType.Sphere : PrimitiveType.Capsule);
-                Object.Destroy(go.GetComponent<Collider>());
-                go.GetComponent<MeshRenderer>().sharedMaterial = mat;
-                go.GetComponent<MeshRenderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-                go.transform.SetParent(root, false);
-                parts[i] = go.transform;
-            }
-        }
-
-        static void Place(Transform t, Vector3 a, Vector3 b, float rx, float rz, Vector3 fwdHint)
-        {
-            Vector3 d = b - a;
-            float len = d.magnitude;
-            if (len < 1e-4f) { t.localScale = Vector3.zero; return; }
-            Vector3 up = d / len;
-            Vector3 f = Vector3.ProjectOnPlane(fwdHint, up);
-            if (f.sqrMagnitude < 1e-4f) f = Vector3.ProjectOnPlane(Vector3.forward, up);
-            t.localPosition = (a + b) * 0.5f;
-            t.localRotation = Quaternion.LookRotation(f.normalized, up);
-            t.localScale = new Vector3(rx * 2f, (len + 2f * Mathf.Min(rx, rz)) * 0.5f, rz * 2f);
-        }
-
-        public void Update(BodyRig b, bool on, bool debugVisible)
-        {
-            parts[0].parent.gameObject.SetActive(on);
-            if (!on) return;
-            mat.SetFloat("_ColorMask", debugVisible ? 15f : 0f);
-            for (int i = 0; i < Limbs.Length; i++)
-            {
-                float r = Limbs[i].r * b.Unit;
-                if (i < 4 && b.Shape[BodyRig.ShapeArm] > 0f) r = b.Shape[BodyRig.ShapeArm] * (i < 2 ? 0.8f : 0.65f);   // measured arm, inside the sleeve
-                Place(parts[i], b.J[Limbs[i].a], b.J[Limbs[i].b], r, r, b.Fwd);
-            }
-            int k = Limbs.Length;
-            // torso proxy sits well inside the garment: it only has to hide cloth that is behind the body
-            float torsoHalfW = b.Shape[BodyRig.ShapeChest] > 0f ? b.Shape[BodyRig.ShapeChest] * 0.8f : b.ShoulderW * 0.36f;
-            Place(parts[k], b.HipC, b.ShC, torsoHalfW, 0.072f * b.Unit, b.Fwd);                                  // torso
-            Place(parts[k + 1], b.ShC, b.HeadC - b.Up * 0.05f * b.Unit, 0.05f * b.Unit, 0.05f * b.Unit, b.Fwd);                  // neck
-            parts[k + 2].localPosition = b.HeadC; parts[k + 2].localRotation = b.ChestRot;
-            parts[k + 2].localScale = new Vector3(b.HeadR * 1.9f, b.HeadR * 2.3f, b.HeadR * 2.1f);    // head
-            for (int s = 0; s < 2; s++)
-            {
-                int w = s == 0 ? LM.LWrist : LM.RWrist, ix = s == 0 ? LM.LIndex : LM.RIndex, pk = s == 0 ? LM.LPinky : LM.RPinky;
-                var t = parts[k + 3 + s];
-                t.localPosition = (b.J[w] + b.J[ix] + b.J[pk]) / 3f;
-                t.localScale = Vector3.one * 0.09f * b.Unit;
-            }
         }
     }
 }

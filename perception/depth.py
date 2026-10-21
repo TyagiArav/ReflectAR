@@ -1,14 +1,13 @@
-"""Metric monocular depth (Depth Anything V2 Metric-Indoor-Small, OpenVINO IR).
+"""Metric monocular depth (Depth Anything V2 Metric-Indoor-Small; OpenVINO IR or ONNX, see backend.py).
 
-Runs on its own thread, rate-limited (a few Hz is plenty: it only feeds the smoothed
-user distance, and each inference costs ~0.3 s of CPU); the main loop always reads the
-latest map. When nobody is tracked it drops to an idle rate. This is the 'single camera as a
+Runs on its own thread, capped at `max_hz` so it doesn't starve pose inference of CPU
+(the distance it feeds is smoothed at < 1 Hz anyway); the main loop always reads the
+latest map. This is the 'single camera as a
 depth camera' half of the depth estimate; see fusion in server.py.
 """
 import threading, time
 import numpy as np
 import cv2
-import openvino as ov
 
 IN_W, IN_H = 476, 266                      # multiples of 14 (ViT patch)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
@@ -16,20 +15,16 @@ STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
 class MonoDepth:
-    def __init__(self, core: ov.Core, path="models/da2_metric_indoor_small.xml", device="CPU",
-                 hz=3.0, idle_hz=0.5, threads=2):
-        self.model = core.compile_model(path, device, {"PERFORMANCE_HINT": "LATENCY",
-                                                       "INFERENCE_NUM_THREADS": threads, "NUM_STREAMS": 1})
-        self.period, self.idle_period = 1.0 / hz, 1.0 / idle_hz
-        self.active = False                # set by the main loop: is a person being tracked?
-        self._next = 0.0
+    def __init__(self, backend, max_hz=12.0, idle_hz=0.5):
+        self.model = backend.load("depth", "depth")
+        self.min_period = 1.0 / max_hz if max_hz > 0 else 0.0
+        self.idle_period = 1.0 / idle_hz if idle_hz > 0 else self.min_period
+        self.active = True                 # set by the main loop: is someone being tracked?
         self._frame = None
         self._lock = threading.Lock()
         self.depth = None                  # (IN_H, IN_W) metres from camera
         self.stamp = 0.0
-        self.hz = 0.0                      # achieved inference rate (updated by the caller's log)
-        self.infer_ms = 0.0
-        self.runs = 0
+        self.hz = 0.0
         self._run = True
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -38,26 +33,25 @@ class MonoDepth:
             self._frame = bgr
 
     def _loop(self):
-        req = self.model.create_infer_request()
         while self._run:
-            wait = self._next - time.time()
-            if wait > 0:
-                time.sleep(min(wait, 0.05))
-                continue
             with self._lock:
                 f, self._frame = self._frame, None
             if f is None:
-                time.sleep(0.01)
+                time.sleep(0.003)
                 continue
-            self._next = time.time() + (self.period if self.active else self.idle_period)
-            t0 = time.time()
+            # nobody in view: only refresh occasionally (each run costs real power)
+            wait = (self.min_period if self.active else self.idle_period) - (time.time() - self.stamp)
+            if wait > 0:
+                time.sleep(wait)
+                with self._lock:                     # use the newest frame after the wait
+                    f, self._frame = self._frame if self._frame is not None else f, None
             rgb = cv2.cvtColor(cv2.resize(f, (IN_W, IN_H), interpolation=cv2.INTER_AREA),
                                cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             x = ((rgb - MEAN) / STD).transpose(2, 0, 1)[None]
-            self.depth = req.infer({0: x})[self.model.output(0)][0]
-            self.stamp = time.time()
-            self.infer_ms = (self.stamp - t0) * 1000
-            self.runs += 1
+            self.depth = self.model(np.ascontiguousarray(x))[0][0]
+            t1 = time.time()
+            self.hz = 0.9 * self.hz + 0.1 / max(t1 - self.stamp, 1e-3)    # achieved update rate
+            self.stamp = t1
 
     def sample(self, u, v, img_w, img_h, r=3):
         """Median depth around image pixel (u, v) of the full-res frame."""

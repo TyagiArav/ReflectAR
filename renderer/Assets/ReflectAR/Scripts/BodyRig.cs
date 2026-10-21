@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace ReflectAR
@@ -44,48 +43,30 @@ namespace ReflectAR
         public float UpperL = 0.29f, UpperR = 0.29f, ForeL = 0.26f, ForeR = 0.26f;
         public Capsule[] Colliders = new Capsule[0];
 
+        /// <summary>Measured torso half-width relative to the generic model, at the heights in
+        /// <see cref="BodyShape.Levels"/> (1 = average build). Filled in from the person mask.</summary>
+        public readonly float[] Profile = { 1f, 1f, 1f, 1f, 1f, 1f };
+
+        public void ResetShape()
+        {
+            for (int i = 0; i < Profile.Length; i++) Profile[i] = 1f;
+        }
+
         /// <summary>Body-relative unit: 1 for a 0.36 m shoulder-joint span. Garment and proxy
         /// dimensions scale with it, so the overlay fits even if absolute distance is off.</summary>
         public float Unit => ShoulderW / 0.36f;
 
-        // ---- measured silhouette (from the segmentation mask), robust median over recent readings
-        public const int ShapeHip = 0, ShapeWaist = 1, ShapeChest = 2, ShapeShoulder = 3, ShapeArm = 4;
-        readonly List<float>[] shapeSamples = { new List<float>(), new List<float>(), new List<float>(), new List<float>(), new List<float>() };
-        public readonly float[] Shape = new float[5];        // 0 = unknown
-        public bool ShapeReady => Shape[ShapeChest] > 0f;
-
-        public void AddShape(float[] m)
-        {
-            if (m == null || m.Length < 5) return;
-            for (int i = 0; i < 5; i++)
-            {
-                if (m[i] <= 0f) continue;
-                var l = shapeSamples[i];
-                l.Add(m[i]);
-                if (l.Count > 40) l.RemoveAt(0);
-                if (l.Count >= 8)
-                {
-                    var sorted = new List<float>(l); sorted.Sort();
-                    Shape[i] = sorted[sorted.Count / 2];
-                }
-            }
-        }
-
-        public void ResetShape()
-        {
-            foreach (var l in shapeSamples) l.Clear();
-            System.Array.Clear(Shape, 0, Shape.Length);
-        }
-
         public Quaternion ChestRot => Quaternion.LookRotation(Fwd, Up);
         public Quaternion PelvisRot => Quaternion.LookRotation(PFwd, Up);
 
-        public float smoothing = 90f;               // 1/s: light interpolation between camera frames (perception already filters)
+        /// <summary>1/s; 0 = follow the target exactly. TrackingClient already filters and predicts
+        /// the pose every render frame, and any smoothing here would add lag back (30/s ~ 33 ms).</summary>
+        public float smoothing = 0f;
         bool measured;
 
         public void Update(Vector3[] target, float[] vis, float dt, bool snap)
         {
-            float a = snap ? 1f : 1f - Mathf.Exp(-smoothing * dt);
+            float a = snap || smoothing <= 0f ? 1f : 1f - Mathf.Exp(-smoothing * dt);
             for (int i = 0; i < 33; i++)
             {
                 J[i] = Vector3.Lerp(J[i], target[i], a);

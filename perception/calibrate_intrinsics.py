@@ -7,7 +7,7 @@ Writes calib/intrinsics.json, which server.py loads instead of the hfov guess.
 Turn OFF Center Stage (Control Centre > Video Effects) first: it crops/zooms the image and
 silently changes the focal length.
 """
-import argparse, json
+import argparse, json, sys
 import numpy as np
 import cv2
 
@@ -21,7 +21,7 @@ a = ap.parse_args()
 
 obj = np.zeros((a.rows * a.cols, 3), np.float32)
 obj[:, :2] = np.mgrid[0:a.cols, 0:a.rows].T.reshape(-1, 2) * a.square
-cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+cap = cv2.VideoCapture(0, {"darwin": cv2.CAP_AVFOUNDATION, "win32": cv2.CAP_MSMF}.get(sys.platform, cv2.CAP_ANY))
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, a.width); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, a.height)
 objs, imgs, size = [], [], None
 crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)

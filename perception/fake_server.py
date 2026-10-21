@@ -63,13 +63,13 @@ def main():
     img = np.zeros((540, 960, 3), np.uint8)
     img[:] = (60, 50, 45)
     cv2.putText(img, "SYNTHETIC FEED", (300, 280), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (200, 200, 200), 3)
-    import struct
-    jpg = struct.pack(">HH", img.shape[1], img.shape[0]) + cv2.cvtColor(img, cv2.COLOR_BGR2RGB).tobytes()
     t0, seq, prog = time.time(), 0, 0.0
     while True:
-        t = time.time() - t0
+        now = time.time()
+        t = now - t0
         J = skeleton(t, args.script)
         J[:, 2] += args.dist - 1.8
+        V = (skeleton(t + 0.01, args.script) - skeleton(t - 0.01, args.script)) / 0.02
         eye = (J[2] + J[5]) / 2
         events = []
         if args.script == "fist":
@@ -83,12 +83,14 @@ def main():
             events.append("next")
         d = float(J[23:25, 2].mean())
         rng = "too_close" if d < 1.0 else "too_far" if d > 3.0 else "ok"
-        msg = {"t": time.time(), "seq": seq, "tracked": True, "range": rng, "dist": d, "events": events,
+        msg = {"t": now, "seq": seq, "tracked": True, "range": rng, "dist": d, "events": events,
                "fist_progress": prog if prog < 1 else 0.0, "fist_hand": "right" if prog > 0 else "",
-               "joints": J.ravel().round(4).tolist(), "vis": [0.99] * 33, "eye": eye.round(4).tolist(),
+               "joints": J.ravel().round(4).tolist(), "vel": V.ravel().round(3).tolist(), "vis": [0.99] * 33,
+               "eye": eye.round(4).tolist(), "eye_vel": ((V[2] + V[5]) / 2).round(3).tolist(),
                "cam": {**K.as_dict(), "pos": cfg["camera_pose"]["pos_m"], "tilt": 0.0}, "screen": cfg["screen"],
+               "predict": cfg.get("predict", {}),
                "proc_fps": 30.0, "depth_hz": 0.0, "scale": 1.0, "z_skel": d, "z_da": 0.0}
-        net.push(msg, jpg if seq % 30 == 0 else None)
+        net.push(msg, (now, img) if seq % 30 == 0 else None)   # Streamer resizes + sends it raw
         seq += 1
         time.sleep(1 / 30)
 

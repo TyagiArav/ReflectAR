@@ -8,8 +8,8 @@ namespace ReflectAR
     public struct RestSkeleton
     {
         public float L, sw, hipW, u, upperL, upperR, foreL, foreR;
-        public float mHip, mWaist, mChest, mShoulder, mArm;   // measured half-widths / arm radius (0 = unknown)
         public Vector3 hipC, shC, lSh, rSh, lEl, rEl, lWr, rWr;
+        public float[] profile;                  // measured torso widths (BodyRig.Profile), copied
         public const float ArmDropDeg = 40f;
 
         public static RestSkeleton From(BodyRig b)
@@ -18,8 +18,7 @@ namespace ReflectAR
             {
                 L = b.TorsoLen, sw = b.ShoulderW, hipW = b.HipW, u = b.Unit,
                 upperL = b.UpperL, upperR = b.UpperR, foreL = b.ForeL, foreR = b.ForeR,
-                mHip = b.Shape[BodyRig.ShapeHip], mWaist = b.Shape[BodyRig.ShapeWaist], mChest = b.Shape[BodyRig.ShapeChest],
-                mShoulder = b.Shape[BodyRig.ShapeShoulder], mArm = b.Shape[BodyRig.ShapeArm],
+                profile = (float[])b.Profile.Clone(),
             };
             r.hipC = Vector3.zero;
             r.shC = new Vector3(0, r.L, 0);
@@ -36,25 +35,38 @@ namespace ReflectAR
             return new Vector3(side * Mathf.Cos(a), -Mathf.Sin(a), 0f);
         }
 
-        /// <summary>Body (not garment) torso half-width a and half-depth d at height y.</summary>
+        /// <summary>Body (not garment) torso half-width a and half-depth d at height y: the generic
+        /// model, reshaped by the measured profile. Wider than average also means deeper (chest,
+        /// belly), at 60 % of the width change.</summary>
         public void TorsoRadii(float y, out float a, out float d)
         {
             float t = y / L;
-            // measured silhouette where we have it, average proportions otherwise
-            float hipA = mHip > 0 ? mHip : hipW * 0.68f + 0.02f * u;
-            float chestA = mChest > 0 ? mChest : sw * 0.5f * 0.9f;
-            if (mHip <= 0 && mChest > 0) hipA = chestA * 0.95f;
-            float waistA = mWaist > 0 ? mWaist : Mathf.Lerp(hipA, chestA, 0.45f) * 0.93f;
-            a = Pw(t, new[] { -0.3f, 0f, 0.3f, 0.7f, 1f }, new[] { hipA * 1.04f, hipA, waistA, chestA, chestA * 0.92f });
-            d = Pw(t, new[] { -0.3f, 0f, 0.3f, 0.7f, 1f }, new[] { 0.11f, 0.105f, 0.098f, 0.108f, 0.075f }) * u;
+            BodyModel(t, hipW, sw, u, out a, out d);
+            if (profile == null) return;
+            float r = BodyShape.ProfileAt(profile, t);
+            a *= r;
+            d *= 1f + (r - 1f) * 0.6f;
         }
 
-        static float Pw(float s, float[] ks, float[] vs)
+        /// <summary>Generic torso half-width / half-depth at t = height / torso length, from hip and
+        /// shoulder width (an average build).</summary>
+        public static void BodyModel(float t, float hipW, float sw, float u, out float a, out float d)
         {
-            if (s <= ks[0]) return vs[0];
-            for (int i = 1; i < ks.Length; i++)
-                if (s <= ks[i]) return Mathf.Lerp(vs[i - 1], vs[i], (s - ks[i - 1]) / (ks[i] - ks[i - 1]));
-            return vs[vs.Length - 1];
+            float hipA = hipW * 0.68f + 0.02f * u, chestA = sw * 0.5f * 0.9f;
+            float waistA = Mathf.Lerp(hipA, chestA, 0.45f) * 0.93f;
+            a = Pw(t, hipA * 1.04f, hipA, waistA, chestA, chestA * 0.92f);
+            d = Pw(t, 0.11f, 0.105f, 0.098f, 0.108f, 0.075f) * u;
+        }
+
+        // piecewise linear through knots t = -0.3, 0, 0.3, 0.7, 1
+        static float Pw(float t, float v0, float v1, float v2, float v3, float v4)
+        {
+            if (t <= -0.3f) return v0;
+            if (t <= 0f) return Mathf.Lerp(v0, v1, (t + 0.3f) / 0.3f);
+            if (t <= 0.3f) return Mathf.Lerp(v1, v2, t / 0.3f);
+            if (t <= 0.7f) return Mathf.Lerp(v2, v3, (t - 0.3f) / 0.4f);
+            if (t <= 1f) return Mathf.Lerp(v3, v4, (t - 0.7f) / 0.3f);
+            return v4;
         }
     }
 
@@ -65,19 +77,27 @@ namespace ReflectAR
         public int[] tris;
         public BoneWeight[] weights;     // bones: 0 pelvis, 1 chest, 2 L upper, 3 R upper, 4 L fore, 5 R fore
         public float[] looseness;        // 0 = pinned at the shoulders/collar, 1 = free at the hem/cuffs
+
+        // rendering: seams of the UV layout split vertices
+        public int[] renderToSim;        // render vertex -> simulated vertex
+        public Vector2[] uv;             // per render vertex, metres along the fabric
+        public int[] renderTris;
     }
 
     /// <summary>
     /// Builds a garment as the zero set of a signed distance field (torso, shoulders and sleeves
     /// blended with smooth unions, so armpits and shoulders are one continuous surface), meshed
     /// with surface nets, then cut open at the neck, hem and cuffs.
+    ///
+    /// The torso follows the user's measured build (RestSkeleton.TorsoRadii). Below the chest the
+    /// cut hangs from whatever is widest above it (chest or belly) by GarmentSpec.fit, the way
+    /// fabric falls instead of tucking into the waist; ribbed hem bands pull back in to the hips.
     /// </summary>
     public static class GarmentMesher
     {
         // Voxel size of the build; set per call (thread-static, since builds run on worker threads).
         [System.ThreadStatic] static float Cell;
         public const float DefaultCell = 0.017f;
-        public const float EaseScale = 0.55f;
 
         // ---------------------------------------------------------------- SDF helpers
         static float SMin(float a, float b, float k)
@@ -101,6 +121,45 @@ namespace ReflectAR
             public float hemY, neckR, e;
             public Vector3 lEnd, rEnd, lDir, rDir;
             public bool lLong, rLong;
+            // garment half-width / half-depth (ease included) vs height
+            public float[] ga, gd;
+            public float y0, dy;
+
+            public readonly void Radii(float y, out float a, out float d)
+            {
+                float f = Mathf.Clamp((y - y0) / dy, 0f, ga.Length - 1.001f);
+                int i = (int)f; f -= i;
+                a = Mathf.Lerp(ga[i], ga[i + 1], f);
+                d = Mathf.Lerp(gd[i], gd[i + 1], f);
+            }
+        }
+
+        /// <summary>Garment cross-section vs height: the body plus ease, hanging straight down
+        /// from the widest point above (by fit) below the chest, pulled in at a hem band.</summary>
+        static void BuildTables(ref Ctx c)
+        {
+            const int N = 128;
+            var s = c.s; var g = c.g;
+            c.y0 = -0.4f * s.L; c.dy = (s.L - c.y0) / (N - 1);
+            c.ga = new float[N]; c.gd = new float[N];
+            var ba = new float[N]; var bd = new float[N];
+            for (int i = 0; i < N; i++) s.TorsoRadii(c.y0 + i * c.dy, out ba[i], out bd[i]);
+            float hangTop = 0.72f * s.L, band = 0.06f * s.u, fit = Mathf.Clamp01(g.fit);
+            float maxA = 0f, maxD = 0f;
+            for (int i = N - 1; i >= 0; i--)
+            {
+                float y = c.y0 + i * c.dy;
+                if (y >= hangTop) { maxA = ba[i]; maxD = bd[i]; }
+                else { maxA = Mathf.Max(maxA, ba[i]); maxD = Mathf.Max(maxD, bd[i]); }
+                float a = Mathf.Lerp(ba[i], maxA, fit) + c.e, d = Mathf.Lerp(bd[i], maxD, fit) + c.e;
+                if (g.hemBand > 0f)
+                {
+                    float k = (1f - Mathf.SmoothStep(0f, 1f, (y - c.hemY) / band)) * Mathf.Clamp01(g.hemBand);
+                    a = Mathf.Lerp(a, ba[i] + 0.35f * c.e, k);
+                    d = Mathf.Lerp(d, bd[i] + 0.35f * c.e, k);
+                }
+                c.ga[i] = a; c.gd[i] = d;
+            }
         }
 
         static Vector3 SleeveEnd(RestSkeleton s, float side, float frac, out Vector3 dir, out bool reachesForearm)
@@ -116,15 +175,11 @@ namespace ReflectAR
         static float Sdf(in Ctx c, Vector3 p)
         {
             var s = c.s; var g = c.g; float u = s.u, e = c.e;
-            // torso: elliptic cylinder with a body-shaped profile, rounded into the shoulders
-            s.TorsoRadii(Mathf.Clamp(p.y, -0.4f * s.L, s.L), out float a, out float d);
-            a += e; d += e;
+            // torso: elliptic cylinder with the garment's cross-section, rounded into the shoulders
+            c.Radii(p.y, out float a, out float d);
             float torso = (Mathf.Sqrt(p.x * p.x / (a * a) + p.z * p.z / (d * d)) - 1f) * Mathf.Min(a, d);
             torso = SMax(torso, p.y - (s.L - 0.02f * u), 0.05f * u);
-            // shoulder cap: its outer edge lands on the measured shoulder silhouette (+ ease)
-            float rS = 0.05f * u + e * 0.5f;
-            float shX = s.mShoulder > 0 ? Mathf.Max(s.mShoulder + e - rS, s.sw * 0.3f) : s.sw * 0.5f;
-            float shoulders = Capsule(p, new Vector3(-shX, s.L + 0.005f, 0), new Vector3(shX, s.L + 0.005f, 0), rS, rS);
+            float shoulders = Capsule(p, s.lSh + Vector3.up * 0.005f, s.rSh + Vector3.up * 0.005f, 0.058f * u + e, 0.058f * u + e);
             float body = SMin(torso, shoulders, 0.07f * u);
             // neck band rising slightly above the shoulders (collar base)
             float bandTop = g.neck == Neckline.Collar ? 0.075f * u : 0.025f * u;
@@ -146,14 +201,21 @@ namespace ReflectAR
             }
             else if (g.sleeve > 0f)
             {
-                float se = g.sleeveEase * u * EaseScale;
+                float se = g.sleeveEase * u;
                 for (int side = -1; side <= 1; side += 2)
                 {
                     Vector3 sh = side < 0 ? s.lSh : s.rSh, end = side < 0 ? c.lEnd : c.rEnd, dir = side < 0 ? c.lDir : c.rDir;
                     Vector3 start = sh - Vector3.right * side * 0.03f * u + Vector3.up * 0.01f * u;
-                    float armR = s.mArm > 0 ? s.mArm : 0.05f * u;                      // measured upper-arm radius
-                    float r0 = armR * 1.1f + se, r1 = Mathf.Lerp(r0, armR * 0.8f + se, g.sleeve) + g.cuffFlare * u;
-                    float arm = Capsule(p, start, end, r0, r1);
+                    float r0 = 0.062f * u + se, r1 = Mathf.Lerp(r0, 0.043f * u + se, g.sleeve) + g.cuffFlare * u;
+                    float arm;
+                    if (g.cuffBand && (side < 0 ? c.lLong : c.rLong))
+                    {
+                        // gathered cuff at the wrist; the sleeve above blouses over it
+                        Vector3 bandStart = end - dir * (0.055f * u);
+                        float rb = 0.041f * u + 0.25f * se;
+                        arm = SMin(Capsule(p, start, bandStart, r0, r1), Capsule(p, bandStart, end, rb, rb), 0.008f * u);
+                    }
+                    else arm = Capsule(p, start, end, r0, r1);
                     arm = Mathf.Max(arm, Vector3.Dot(p - end, dir));             // flat cuff
                     body = SMin(body, arm, 0.06f * u);
                 }
@@ -163,7 +225,7 @@ namespace ReflectAR
             {
                 Vector3 q = p - new Vector3(0, s.L + 0.02f * u, -0.075f * u);
                 float ca = Mathf.Cos(-35f * Mathf.Deg2Rad), sa = Mathf.Sin(-35f * Mathf.Deg2Rad);
-                q = new Vector3(q.x, ca * q.y - sa * q.z, sa * q.y + ca * q.z);           // rotate about X
+                q = new Vector3(q.x, ca * q.y - sa * q.z, sa * q.y + ca * q.z);           // rotate about X (worker-thread safe)
                 float ring = new Vector2(new Vector2(q.x, q.z).magnitude - 0.105f * u, q.y).magnitude - 0.045f * u;
                 ring = Mathf.Max(ring, p.z - (0.01f * u));                        // back half only
                 body = SMin(body, ring, 0.03f * u);
@@ -186,11 +248,10 @@ namespace ReflectAR
         public static GarmentMeshData Build(RestSkeleton s, GarmentSpec g, float cell = DefaultCell)
         {
             Cell = cell;
-            // ease is applied on top of the measured silhouette (which already includes the user's
-            // own clothes), so only a fraction of the nominal garment ease is needed
-            var c = new Ctx { s = s, g = g, e = g.ease * s.u * EaseScale, hemY = g.hem * s.L, neckR = 0.068f * s.u };
+            var c = new Ctx { s = s, g = g, e = g.ease * s.u, hemY = g.hem * s.L, neckR = 0.068f * s.u };
             c.lEnd = SleeveEnd(s, -1, g.sleeve, out c.lDir, out c.lLong);
             c.rEnd = SleeveEnd(s, +1, g.sleeve, out c.rDir, out c.rLong);
+            BuildTables(ref c);
 
             // ---- sample grid
             float xr = g.sleeve > 0f ? Mathf.Max(Mathf.Abs(c.lEnd.x), c.rEnd.x) + 0.1f : s.sw * 0.5f + 0.15f;
@@ -317,6 +378,7 @@ namespace ReflectAR
             SmoothBoundaries(data);
             data.restN = Normals(data.rest, data.tris);
             Skin(data, s, g, c);
+            Unwrap(data, s, g, c);
             return data;
         }
 
@@ -452,9 +514,122 @@ namespace ReflectAR
                                        : (dist[3] < dist[5] ? tr * s.upperR : s.upperR + trf * s.foreR);
                 float tArm = sleeveLen > 0.01f ? Mathf.Clamp01(along / sleeveLen) : 0f;
                 float loose = Mathf.Lerp(tTorso, tArm, armW);
+                // elastic bands hold on to the body
+                if (g.hemBand > 0f && p.y < c.hemY + 0.06f * s.u) loose *= Mathf.Lerp(1f, 0.45f, Mathf.Clamp01(g.hemBand) * (1f - armW));
+                if (g.cuffBand && armW > 0.5f && along > sleeveLen - 0.06f * s.u) loose *= 0.45f;
                 if (p.y > s.L - 0.02f * s.u && Mathf.Abs(p.x) < s.sw * 0.5f) loose = 0f;      // collar / yoke
                 d.looseness[i] = loose;
             }
+        }
+
+        // ---------------------------------------------------------------- UV layout
+        const int ChFront = 0, ChBack = 1, ChYoke = 2, ChSleeveL = 3, ChSleeveR = 4;
+
+        /// <summary>
+        /// Lays the fabric out like sewn pattern pieces, so a 2D texture (HDRP/Lit) sits on it with
+        /// little stretch: front and back panels unrolled around the torso (side seams), a yoke over
+        /// the shoulder tops, and each sleeve unrolled around the arm (seam underneath). UVs are in
+        /// metres of fabric. Seam vertices are duplicated for rendering; the solver keeps the welded mesh.
+        /// </summary>
+        static void Unwrap(GarmentMeshData d, RestSkeleton s, GarmentSpec g, Ctx c)
+        {
+            var tris = d.tris; var r = d.rest; var w = d.weights;
+            int cap = r.Length * 5 / 4;
+            var map = new Dictionary<long, int>(cap);
+            var toSim = new List<int>(cap);
+            var uvs = new List<Vector2>(cap);
+            var rt = new int[tris.Length];
+            var fu = new float[3]; var fv = new float[3]; var fr = new float[3];
+            bool sleeves = g.sleeve > 0f && !g.tank;
+            for (int t = 0; t < tris.Length; t += 3)
+            {
+                int i0 = tris[t], i1 = tris[t + 1], i2 = tris[t + 2];
+                Vector3 cen = (r[i0] + r[i1] + r[i2]) / 3f;
+                Vector3 n = Vector3.Cross(r[i1] - r[i0], r[i2] - r[i0]).normalized;
+                float arm = (ArmW(w[i0]) + ArmW(w[i1]) + ArmW(w[i2])) / 3f;
+                bool onArm = false;
+                if (sleeves && arm > 0.5f)
+                {
+                    // not the armpit's body side, which faces along the arm and would smear in a sleeve chart
+                    float sd = cen.x < 0 ? -1f : 1f;
+                    Vector3 dir = RestSkeleton.ArmDir(sd), rel = cen - (sd < 0 ? s.lSh : s.rSh);
+                    onArm = (rel - dir * Vector3.Dot(rel, dir)).magnitude < 1.5f * (0.062f + g.sleeveEase) * s.u;
+                }
+                int ch = onArm ? (cen.x < 0 ? ChSleeveL : ChSleeveR)
+                       : n.y > 0.55f && cen.y > 0.8f * s.L ? ChYoke
+                       : cen.z >= 0f ? ChFront : ChBack;
+                for (int k = 0; k < 3; k++) ChartUV(ch, r[tris[t + k]], s, c, out fu[k], out fv[k], out fr[k]);
+                // sleeves wrap around: a triangle across the seam moves its negative-angle corners one turn on
+                bool cyl = ch >= ChSleeveL;
+                bool across = cyl && Mathf.Max(fu[0], Mathf.Max(fu[1], fu[2])) - Mathf.Min(fu[0], Mathf.Min(fu[1], fu[2])) > Mathf.PI;
+                for (int k = 0; k < 3; k++)
+                {
+                    int vi = tris[t + k];
+                    int wrap = across && fu[k] < 0f ? 1 : 0;
+                    float uu = cyl ? (fu[k] + wrap * 2f * Mathf.PI) * fr[k] : fu[k];
+                    long key = ((long)vi << 4) | ((long)ch << 1) | (long)wrap;
+                    if (!map.TryGetValue(key, out int ri))
+                    {
+                        ri = toSim.Count;
+                        map[key] = ri;
+                        toSim.Add(vi);
+                        uvs.Add(new Vector2(uu, fv[k]));
+                    }
+                    rt[t + k] = ri;
+                }
+            }
+            d.renderToSim = toSim.ToArray();
+            d.uv = uvs.ToArray();
+            d.renderTris = rt;
+        }
+
+        static float ArmW(BoneWeight b) => (b.boneIndex0 >= 2 ? b.weight0 : 0f) + (b.boneIndex1 >= 2 ? b.weight1 : 0f)
+                                         + (b.boneIndex2 >= 2 ? b.weight2 : 0f) + (b.boneIndex3 >= 2 ? b.weight3 : 0f);
+
+        /// <summary>Fabric coordinates of rest point p in chart ch. For sleeves u is the angle around
+        /// the arm (seam underneath at +-pi) and rad the distance from the arm axis.</summary>
+        static void ChartUV(int ch, Vector3 p, RestSkeleton s, Ctx c, out float u, out float v, out float rad)
+        {
+            rad = 0f;
+            if (ch == ChFront || ch == ChBack)
+            {
+                // arc length around the garment's cross-section from the centre front / back,
+                // scaled down where the surface is inside it (collar, hood)
+                c.Radii(p.y, out float a, out float d);
+                float x = p.x / a, z = (ch == ChFront ? p.z : -p.z) / d;
+                u = EllipseArc(a, d, Mathf.Atan2(x, z)) * Mathf.Sqrt(x * x + z * z);
+                v = p.y;
+                return;
+            }
+            if (ch == ChYoke)
+            {
+                u = p.x;
+                v = s.L + 0.3f + p.z;
+                return;
+            }
+            float side = ch == ChSleeveL ? -1f : 1f;
+            Vector3 dir = RestSkeleton.ArmDir(side);
+            Vector3 rel = p - (side < 0 ? s.lSh : s.rSh);
+            float along = Vector3.Dot(rel, dir);
+            Vector3 rv = rel - dir * along;
+            Vector3 top = (Vector3.up - dir * Vector3.Dot(Vector3.up, dir)).normalized;
+            u = Mathf.Atan2(Vector3.Dot(rv, Vector3.forward), Vector3.Dot(rv, top));
+            rad = rv.magnitude;
+            v = along;
+        }
+
+        /// <summary>Signed arc length of the ellipse (x, z) = (a sin t, d cos t) from t = 0 to th (Simpson).</summary>
+        static float EllipseArc(float a, float d, float th)
+        {
+            const int n = 8;
+            float h = th / n, sum = 0f;
+            for (int i = 0; i <= n; i++)
+            {
+                float t = i * h, ct = Mathf.Cos(t), st = Mathf.Sin(t);
+                float sp = Mathf.Sqrt(a * a * ct * ct + d * d * st * st);
+                sum += sp * (i == 0 || i == n ? 1f : (i % 2 == 1 ? 4f : 2f));
+            }
+            return sum * h / 3f;
         }
     }
 }

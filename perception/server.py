@@ -4,24 +4,33 @@ Webcam -> BlazePose (OpenVINO) + metric mono depth -> 3D joints/eye in the
 Mirror frame -> gestures + range check -> TCP stream to Unity.
 
 Wire format (TCP, Python is the server, Unity connects):
-    1 byte type ('J' = JSON tracking frame, 'R' = raw RGB camera frame: u16 width, u16 height, pixels)
+    1 byte type ('J' = JSON tracking frame, 'R' = raw camera image, 'M' = person mask)
     4 byte big-endian payload length
-    payload
+    payload: 'J' = UTF-8 JSON; 'R' = 8-byte big-endian float64 capture time + uint16 width +
+                   uint16 height + RGB24 pixels (rows bottom first, ready for a texture upload). Raw over localhost costs far
+                   less CPU than a JPEG encode here plus a decode on Unity's main thread;
+             'M' = float64 capture time + uint16 width + uint16 height + person mask
+                   (uint8, rows top first, 255 = person) used to trim the occlusion proxy
+
+Latency: each 'J' frame carries joint positions *and velocities* at the frame's capture time
+'t' plus its send time 't_send'; Unity extrapolates them to the moment each rendered frame
+reaches the screen (see filters.PosePredictor, TrackingClient.Predict).
 
 Run:  .venv/bin/python server.py [--snapshot debug.jpg] [--no-image]
 """
-import argparse, json, os, socket, struct, threading, time
+import argparse, json, os, socket, struct, sys, threading, time
+if sys.platform == "win32":                          # MSMF otherwise takes seconds to open a webcam
+    os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import numpy as np
 import cv2
-import openvino as ov
 
-from blazepose import BlazePose
-from handpose import HandPose, is_fist
-from depth import MonoDepth
-from filters import OneEuro
+from backend import Backend, warmup
+from blazepose import BlazePose, DET_SIZE, LM_SIZE, frame_mask
+from handpose import HandPose, HAND_SIZE, is_fist
+from depth import MonoDepth, IN_H, IN_W
+from filters import OneEuro, PosePredictor
 from geometry import Intrinsics, skeleton_distance, CameraToMirror
 from gestures import Gestures, SIDES
-from silhouette import measure as measure_silhouette
 
 L_EYE, R_EYE = 2, 5
 TORSO = (11, 12, 23, 24)
@@ -31,16 +40,21 @@ TORSO = (11, 12, 23, 24)
 class Camera:
     """Grabs frames on a thread so inference never waits on the driver."""
 
-    def __init__(self, index, w, h, video=None, fps=30):
+    APIS = {"avfoundation": cv2.CAP_AVFOUNDATION, "msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW,
+            "v4l2": cv2.CAP_V4L2, "any": cv2.CAP_ANY}
+
+    def __init__(self, index, w, h, video=None, api="auto"):
         self.video = video
-        self.cap = cv2.VideoCapture(video) if video else cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if api == "auto":
+            api = {"darwin": "avfoundation", "win32": "msmf"}.get(sys.platform, "any")
+        self.cap = cv2.VideoCapture(video) if video else cv2.VideoCapture(index, self.APIS[api])
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)            # never hand us a stale queued frame
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
         if not self.cap.isOpened():
-            raise RuntimeError("Could not open camera. Grant camera access to your terminal app "
-                               "(System Settings > Privacy & Security > Camera).")
+            raise RuntimeError("Could not open camera. macOS: grant camera access to your terminal app "
+                               "(System Settings > Privacy & Security > Camera). Windows: Settings > Privacy > "
+                               "Camera, and close other apps using it; or try \"api\": \"dshow\" in config.json.")
         self.frame, self.stamp, self.seq = None, 0.0, 0
         self.cond = threading.Condition()
         threading.Thread(target=self._loop, daemon=True).start()
@@ -66,9 +80,14 @@ class Camera:
 
 
 class Streamer:
-    """Single-client TCP server. Keeps only the newest image; JSON events are merged."""
+    """Single-client TCP server. Keeps only the newest image; JSON events are merged.
 
-    def __init__(self, host, port):
+    Tracking JSON goes out first; the image is JPEG-encoded afterwards on this thread, so
+    neither the encode nor the larger write delays the pose.
+    """
+
+    def __init__(self, host, port, jpeg_width=960, jpeg_quality=75):
+        self.jpeg_w, self.jpeg_q = jpeg_width, jpeg_quality
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind((host, port))
@@ -76,7 +95,8 @@ class Streamer:
         self.conn = None
         self.lock = threading.Condition()
         self.json_msg = None
-        self.jpeg = None
+        self.image = None                            # (capture time, BGR frame or JPEG bytes)
+        self.mask = None                             # (capture time, uint8 mask)
         threading.Thread(target=self._accept, daemon=True).start()
         threading.Thread(target=self._send, daemon=True).start()
         print(f"[net] listening on {host}:{port}")
@@ -95,33 +115,78 @@ class Streamer:
                     self.conn.close()
                 self.conn = c
 
-    def push(self, msg, jpeg=None):
+    def push(self, msg, image=None, mask=None):
         with self.lock:
             if self.conn is None:
                 msg["events"] = []                   # nobody to act on them: don't replay later
             elif self.json_msg is not None:          # unsent: keep its events
                 msg["events"] = self.json_msg["events"] + msg["events"]
             self.json_msg = msg
-            if jpeg is not None:
-                self.jpeg = jpeg
+            if image is not None:
+                self.image = image
+            if mask is not None:
+                self.mask = mask
             self.lock.notify()
 
     def _send(self):
         while True:
             with self.lock:
                 self.lock.wait_for(lambda: self.json_msg is not None and self.conn is not None)
-                msg, jpg, conn = self.json_msg, self.jpeg, self.conn
-                self.json_msg, self.jpeg = None, None
+                msg, img, mask, conn = self.json_msg, self.image, self.mask, self.conn
+                self.json_msg, self.image, self.mask = None, None, None
             try:
-                if jpg is not None:
-                    conn.sendall(b"R" + struct.pack(">I", len(jpg)) + jpg)
+                msg["t_send"] = time.time()
                 body = json.dumps(msg, separators=(",", ":")).encode()
                 conn.sendall(b"J" + struct.pack(">I", len(body)) + body)
+                if mask is not None:
+                    t_m, m = mask
+                    conn.sendall(b"M" + struct.pack(">IdHH", m.size + 12, t_m, m.shape[1], m.shape[0]) + m.tobytes())
+                if img is not None:
+                    t_img, frame = img
+                    h, w = frame.shape[:2]
+                    fw, fh = self.jpeg_w, int(h * self.jpeg_w / w)
+                    small = cv2.resize(frame, (fw, fh), interpolation=cv2.INTER_AREA)
+                    rgb = cv2.cvtColor(cv2.flip(small, 0), cv2.COLOR_BGR2RGB).tobytes()   # bottom row first, like a Unity texture
+                    conn.sendall(b"R" + struct.pack(">IdHH", len(rgb) + 12, t_img, fw, fh) + rgb)
             except OSError:
                 print("[net] renderer disconnected")
                 with self.lock:
                     if self.conn is conn:
                         self.conn = None
+
+
+class HandWorker:
+    """Fist classifier off the critical path. Only the 5 s select-hold uses it, so the main
+    loop takes the newest result (one frame old) instead of waiting ~5 ms per raised hand."""
+
+    def __init__(self, hands):
+        self.hands = hands
+        self.cond = threading.Condition()
+        self.job = None
+        self.fists, self.ms = {}, 0.0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, bgr, rois):
+        """rois: {side: roi} for the raised hands; returns the newest fist state for those sides."""
+        with self.cond:
+            if rois:
+                self.job = (bgr, rois)
+                self.cond.notify()
+            else:
+                self.job, self.fists = None, {}
+            return {s: v for s, v in self.fists.items() if s in rois}
+
+    def _loop(self):
+        while True:
+            with self.cond:
+                self.cond.wait_for(lambda: self.job is not None)
+                (bgr, rois), self.job = self.job, None
+            t0 = time.perf_counter()
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            fists = {side: is_fist(self.hands(rgb, roi)) for side, roi in rois.items()}
+            with self.cond:
+                self.fists = fists
+            self.ms = 0.9 * self.ms + 0.1 * (time.perf_counter() - t0) * 1000
 
 
 # ------------------------------------------------------------------ calibration
@@ -197,28 +262,39 @@ def main():
     ap.add_argument("--calib-dist", type=float, help="stand exactly this many metres from the camera; "
                     "calibrates the distance estimate and exits")
     ap.add_argument("--log", action="store_true", help="print tracking state every second")
+    ap.add_argument("--ep-log", action="store_true", help="ONNX Runtime info logging: shows how many nodes of "
+                    "each model Core ML / TensorRT took and what fell back to the CPU")
     args = ap.parse_args()
     cfg = json.load(open(args.config))
 
-    core = ov.Core()
-    core.set_property("CPU", {"CACHE_DIR": "models/cache"})
-    perf = cfg.get("perf", {})
-    pose = BlazePose(core, threads=perf.get("pose_threads", 2))
-    hands = HandPose(core, threads=perf.get("hand_threads", 2))
-    depth = MonoDepth(core, hz=perf.get("depth_hz", 3.0), idle_hz=perf.get("depth_idle_hz", 0.5),
-                      threads=perf.get("depth_threads", 2))
-    idle_fps = perf.get("idle_pose_fps", 6.0)
+    comp = cfg.get("compute", {})
+    backend = Backend({**comp, "verbose": args.ep_log})
+    pose = BlazePose(backend)
+    hand_model = HandPose(backend)
+    depth_model_hz = comp.get("depth_max_hz", 12.0)
+    t_w = time.time()                                # compile Core ML programs / TensorRT engines now
+    warmup(pose.det, (1, DET_SIZE, DET_SIZE, 3)); warmup(pose.lm, (1, LM_SIZE, LM_SIZE, 3))
+    warmup(hand_model.model, (1, HAND_SIZE, HAND_SIZE, 3))
+    hands = HandWorker(hand_model)
+    depth = MonoDepth(backend, max_hz=depth_model_hz, idle_hz=comp.get("depth_idle_hz", 0.5))
+    idle_fps = comp.get("idle_pose_fps", 6.0)
+    warmup(depth.model, (1, 3, IN_H, IN_W))
+    print(backend.summary())
+    print(f"[backend] devices {backend.devices}, CPU threads {backend.threads}, depth capped at "
+          f"{depth_model_hz} Hz, warm-up {time.time() - t_w:.1f} s")
     cc = cfg["camera"]
-    cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("fps", 30))
+    cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("api", "auto"))
     frame, _, seq = cam.read(0)
     H, W = frame.shape[:2]
     K = Intrinsics.load(cc, W, H)
     to_mirror = CameraToMirror(cfg["camera_pose"])
-    net = Streamer(cfg["net"]["host"], cfg["net"]["port"])
+    net = Streamer(cfg["net"]["host"], cfg["net"]["port"], cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"])
     gest = Gestures(cfg["gestures"])
     rng = RangeCheck(*cfg["range_m"])
     fj, fe = cfg["filters"]["joints"], cfg["filters"]["eye"]
-    f_joints, f_eye, f_dist = OneEuro(**fj), OneEuro(**fe), OneEuro(1.0, 1.5)
+    f_joints, f_eye, f_dist = PosePredictor(**fj), PosePredictor(**fe), OneEuro(0.5, 0.3)
+    pred_cfg = cfg.get("predict", {})
+    cam_lat = cc.get("latency_s", 0.0)               # exposure -> frame delivered to us
     wfuse = cfg["depth"]["fusion_weight"]
     cal = load_depth_calib()
     calib = DistanceCalibrator(args.calib_dist, cal) if args.calib_dist else None
@@ -226,10 +302,9 @@ def main():
     print(f"[cam] {W}x{H}  fx={K.fx:.0f} ({src})  depth calib: skel={cal['skel']} da={cal['da']} "
           f"from {[p['d'] for p in cal['points']]} m")
 
-    jpeg_w, jpeg_q = cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"]
-    fps, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, ""
-    cam_fps, last_stamp = 30.0, time.time()
-    last_idle_run, depth_runs, depth_t = 0.0, 0, time.time()
+    fps, pose_ms, t_log, t_snap, last_seen, last_dbg = 0.0, 0.0, 0.0, 0.0, 0.0, ""
+    last_da = (None, -1e9)
+    last_idle_run = 0.0
     while True:
         frame, stamp, seq = cam.read(seq)
         # nobody in view for a while: only look for a person a few times a second
@@ -237,13 +312,15 @@ def main():
             continue
         last_idle_run = stamp
         t0 = time.time()
+        t_cap = stamp - cam_lat
         depth.submit(frame)
         res = pose(frame)
-        msg = {"t": stamp, "seq": seq, "tracked": False, "range": "none", "dist": 0.0,
+        pose_ms = 0.9 * pose_ms + 0.1 * (time.time() - t0) * 1000
+        msg = {"t": t_cap, "seq": seq, "tracked": False, "range": "none", "dist": 0.0,
                "events": [], "fist_progress": 0.0, "fist_hand": "",
                "cam": {**K.as_dict(), "pos": cfg["camera_pose"]["pos_m"],
                        "tilt": cfg["camera_pose"].get("tilt_down_deg", 0.0)},
-               "screen": cfg["screen"]}
+               "screen": cfg["screen"], "predict": pred_cfg}
         fists = {}
         cue = skeleton_distance(res["uv"], res["world"], res["vis"], K) if res else None
         if cue is not None:
@@ -257,6 +334,10 @@ def main():
             samples = [s for s in samples if s]
             z_da_raw = float(np.median(samples)) + cfg["depth"]["torso_surface_offset_m"] if samples else None
             z_da = cal["da"][0] * z_da_raw + cal["da"][1] if z_da_raw else None
+            if z_da:
+                last_da = (z_da, stamp)
+            elif stamp - last_da[1] < 0.5:            # brief dropout (stale map during fast motion,
+                z_da = last_da[0]                     # torso samples hit background): hold, don't switch cue
             if z_skel is None:
                 if not z_da:
                     z_skel = max(z_skel_raw, 0.3)
@@ -275,28 +356,25 @@ def main():
             #     so the 3D skeleton always lands exactly on the person in the image
             Z = np.maximum(z_root + (world[:, 2] - world[list(TORSO), 2].mean()), 0.2)
             P_c = np.stack([(uv[:, 0] - K.cx) * Z / K.fx, (uv[:, 1] - K.cy) * Z / K.fy, Z], axis=1)
-            P_m = f_joints(to_mirror(P_c), stamp)
-            eye = f_eye(to_mirror((P_c[L_EYE] + P_c[R_EYE]) / 2), stamp)
+            P_m, V_m = f_joints(to_mirror(P_c), stamp, vis)
+            eye, eye_v = f_eye(to_mirror((P_c[L_EYE] + P_c[R_EYE]) / 2), stamp)
             dist = z_root
             z_skel_log, z_da_log, scale = z_skel, z_da, z_fused / max(z_skel, 1e-3)
 
-            # --- hands for the fist gesture (only for raised hands)
-            rgb = None
+            # --- hands for the fist gesture (only for raised hands), async: result is 1 frame old
+            rois = {}
             for side, (wi, si) in SIDES.items():
                 if vis[wi] > 0.5 and P_m[wi, 1] > P_m[si, 1] - 0.05:
                     roi = HandPose.roi_from_pose(uv, side)
                     if roi is not None:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if rgb is None else rgb
-                        fists[side] = is_fist(hands(rgb, roi))
-            # actual body widths from the segmentation mask (cheap; a few times a second is plenty)
-            if seq % 5 == 0:
-                sil = measure_silhouette(res["seg"], res["seg_affine"], uv, vis)
-                to_m = z_root / K.fx
-                msg["shape"] = [round(sil.get(k, 0.0) * to_m, 4) for k in ("hip", "waist", "chest", "shoulder", "arm")]
+                        rois[side] = roi
+            fists = hands.submit(frame, rois)
             msg.update(tracked=True, range=rng(dist), dist=dist,
                        joints=np.round(P_m, 4).ravel().tolist(),
+                       vel=np.round(V_m, 3).ravel().tolist(),
                        vis=np.round(vis, 3).tolist(),
                        eye=np.round(eye, 4).tolist(),
+                       eye_vel=np.round(eye_v, 3).tolist(),
                        uv=np.round(uv, 1).ravel().tolist(),
                        z_skel=round(z_skel_log, 3), z_da=round(z_da_log or 0.0, 3), scale=round(scale, 3))
             if rng.state == "ok":
@@ -311,21 +389,15 @@ def main():
             gest.reset()
             if stamp - last_seen > 1.0:
                 f_joints.reset(); f_eye.reset(); f_dist.reset()
-        depth.active = stamp - last_seen < 3.0
 
-        jpg = None
-        if not args.no_image and net.connected:          # nobody watching: skip the JPEG encode
-            # Raw RGB over localhost (~1.5 MB/frame) is far cheaper than JPEG encode here + decode in Unity.
-            fw_, fh_ = jpeg_w, int(H * jpeg_w / W)
-            small = cv2.resize(frame, (fw_, fh_), interpolation=cv2.INTER_AREA)
-            jpg = struct.pack(">HH", fw_, fh_) + cv2.cvtColor(small, cv2.COLOR_BGR2RGB).tobytes()
+        depth.active = stamp - last_seen < 3.0
         dt = time.time() - t0
         fps = 0.9 * fps + 0.1 / max(dt, 1e-3)
         msg["proc_fps"], msg["depth_hz"] = round(fps, 1), round(depth.hz, 1)
-        cam_fps = 0.9 * cam_fps + 0.1 / max(stamp - last_stamp, 1e-3); last_stamp = stamp
-        msg["lat_ms"] = round((time.time() - stamp) * 1000, 1)
-        msg["cam_fps"] = round(cam_fps, 1)
-        net.push(msg, jpg)
+        msg["proc_ms"] = round(dt * 1000, 1)
+        mask_w = cfg["net"].get("mask_width", 256)
+        mask = (t_cap, frame_mask(res, W, H, mask_w)) if res and msg["tracked"] and mask_w else None
+        net.push(msg, None if args.no_image else (t_cap, frame), mask)
 
         if msg["events"]:
             print(f"[gesture] {msg['events']}   {gest.debug}")
@@ -333,12 +405,11 @@ def main():
             print(f"[swipe?] {gest.debug}")
         last_dbg = gest.debug
         if args.log and stamp - t_log > 1.0:
-            depth.hz = (depth.runs - depth_runs) / max(time.time() - depth_t, 1e-3)
-            depth_runs, depth_t = depth.runs, time.time()
             t_log = stamp
             print(f"[state] tracked={msg['tracked']} range={msg['range']} dist={msg['dist']:.2f} "
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "
-                  f"fists={fists} prog={msg['fist_progress']} proc={fps:.0f}fps cam={cam_fps:.0f}fps lat={msg['lat_ms']}ms depth={depth.hz:.0f}Hz "
+                  f"fists={fists} prog={msg['fist_progress']} pose={pose_ms:.1f}ms hands={hands.ms:.1f}ms "
+                  f"proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
                   f"net={'up' if net.connected else 'down'}")
         if args.snapshot and stamp - t_snap > 1.0:
             t_snap = stamp

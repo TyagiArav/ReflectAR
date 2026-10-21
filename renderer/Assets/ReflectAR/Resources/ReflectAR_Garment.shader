@@ -1,6 +1,7 @@
-// Fabric shader for simulated garments.
-// - Fabric texture is projected triplanar from each vertex's REST position (uv0) and rest normal
-//   (uv1), so the pattern is seamless and stays glued to the cloth while it moves and wrinkles.
+// Fabric shader for simulated garments (URP; under HDRP garments use HDRP/Lit, see GarmentMaterials).
+// - Fabric texture is projected triplanar from each vertex's REST position (uv2) and rest normal
+//   (uv3), so the pattern is seamless and stays glued to the cloth while it moves and wrinkles.
+//   (uv0 holds the pattern-piece layout that HDRP/Lit uses.)
 // - Two-sided wrapped diffuse + a soft sheen rim (cloth scatters light at grazing angles).
 // - Weave height (texture alpha) gives micro shading; silhouette alpha feathers for the mirror.
 Shader "ReflectAR/Garment"
@@ -14,8 +15,6 @@ Shader "ReflectAR/Garment"
         _Boost ("Brightness", Float) = 1.0
         _Sheen ("Sheen", Range(0,1)) = 0.25
         _Feather ("Edge feather", Range(0,0.6)) = 0.15
-        _Placket ("Front closure (0 none, 1 buttons, 2 zipper)", Float) = 0
-        _Front ("x neck y, y hem y, z closure bottom y, w body unit", Vector) = (0.55, -0.05, -0.05, 1)
     }
     SubShader
     {
@@ -40,11 +39,9 @@ Shader "ReflectAR/Garment"
                 half4 _BaseColor;
                 float _Tile;
                 half _Alpha, _Boost, _Sheen, _Feather;
-                float _Placket;
-                float4 _Front;
             CBUFFER_END
 
-            struct A { float4 pos : POSITION; float3 n : NORMAL; float3 rest : TEXCOORD0; float3 restN : TEXCOORD1; };
+            struct A { float4 pos : POSITION; float3 n : NORMAL; float3 rest : TEXCOORD2; float3 restN : TEXCOORD3; };
             struct V { float4 pos : SV_POSITION; float3 n : TEXCOORD0; float3 rest : TEXCOORD1; float3 restN : TEXCOORD2; float3 wp : TEXCOORD3; };
 
             V vert (A i)
@@ -82,25 +79,6 @@ Shader "ReflectAR/Garment"
                 half diff = saturate(ndl * 0.7 + 0.3);
                 half sheen = pow(1.0 - ndv, 3.0) * _Sheen * saturate(ndl * 0.5 + 0.5);
                 half weave = lerp(0.88, 1.06, fab.a);
-                // front closure, placed on the rest-pose centre front so it rides along with the fabric
-                if (_Placket > 0.5 && i.rest.z > 0 && i.restN.z > 0.25 && i.rest.y < _Front.x && i.rest.y > _Front.z)
-                {
-                    float u = _Front.w, dx = abs(i.rest.x);
-                    float edge = 1.0 - smoothstep(0.0, 0.0025 * u, abs(dx - 0.017 * u));     // placket stitch lines
-                    albedo *= 1.0 - 0.35 * edge;
-                    if (_Placket < 1.5)
-                    {
-                        float pitch = 0.085 * u;
-                        float yb = fmod(_Front.x - 0.03 * u - i.rest.y + 100.0 * pitch, pitch) - pitch * 0.5;
-                        float r = length(float2(i.rest.x, yb));
-                        if (r < 0.007 * u) albedo = lerp(albedo, half3(0.86, 0.84, 0.8), 0.9) * (0.75 + 0.5 * smoothstep(0.007 * u, 0.0, r));
-                    }
-                    else if (dx < 0.0045 * u)
-                    {
-                        float teeth = step(0.5, frac(i.rest.y / (0.004 * u)));
-                        albedo = lerp(half3(0.18, 0.18, 0.19), half3(0.55, 0.55, 0.58), teeth * 0.6);
-                    }
-                }
                 half3 col = (albedo * (0.26 + 0.82 * diff * l.color) * weave + sheen * lerp(albedo, 1.0, 0.4)) * _Boost;
                 half edge = smoothstep(0.0, _Feather, ndv);
                 return half4(col, _Alpha * lerp(0.6, 1.0, edge));
