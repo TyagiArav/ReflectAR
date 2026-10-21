@@ -3,6 +3,10 @@
 // projected into the camera image, at where that body part was when the mask was captured
 // (_MaskOffset), and dropped if the mask says it isn't the person. _DepthPush moves the part away
 // from the viewer by its oversize, so its front stays at the real body surface.
+// Over the garment the mask can't tell a hand from the torso behind it, and an oversized part's rim
+// would stand in front of the cloth and cut it, so trimmed fragments that overlap the garment's
+// outline on screen (_ReflectARCover*: capsules in body coords) are dropped too; a fitted,
+// untrimmed copy of each part (BodyProxy) hides the cloth there.
 //
 // HDRP: depth goes in the depth prepass (DepthForwardOnly), so the body also hides opaque
 // garments drawn in the GBuffer and feeds SSAO / contact shadows. The colour pass then draws
@@ -42,9 +46,29 @@ Shader "ReflectAR/DepthOnly"
             float4x4 _ReflectARMaskMatrix;     // body coords -> (u / w, v / h, 1) * camera depth
             float4x4 _ReflectARWorldToBody;    // world -> body coords (MirrorWorld local: the unreflected body)
             float _ReflectARMaskThreshold;
+            float4 _ReflectARCoverA[12], _ReflectARCoverB[12];   // garment outline capsules: ends (body coords), A.w = radius
+            float _ReflectARCoverCount;
+            float4 _ReflectARCamBody;          // the viewpoint in body coords
+
+            // Does the view ray through body point p pass through the garment outline?
+            bool OverGarment (float3 p)
+            {
+                float3 o = _ReflectARCamBody.xyz, d = normalize(p - o);
+                for (int k = 0; k < 12; k++)
+                {
+                    if (k >= (int)_ReflectARCoverCount) break;
+                    float3 a = _ReflectARCoverA[k].xyz, ab = _ReflectARCoverB[k].xyz - a, ao = a - o;
+                    float de = dot(d, ab), ee = dot(ab, ab), den = ee - de * de;
+                    float s = den > 1e-8 ? saturate((dot(d, ao) * de - dot(ab, ao)) / den) : 0;
+                    float3 w = a + ab * s - o;             // segment point closest to the ray, from the eye
+                    float t = dot(w, d), r = _ReflectARCoverA[k].w;
+                    if (dot(w, w) - t * t < r * r) return true;
+                }
+                return false;
+            }
 
             struct A { float4 pos : POSITION; float3 n : NORMAL; };
-            struct V { float4 pos : SV_POSITION; float3 n : TEXCOORD0; float3 body : TEXCOORD1; };
+            struct V { float4 pos : SV_POSITION; float3 n : TEXCOORD0; float3 body : TEXCOORD1; float3 bodyNow : TEXCOORD2; };
 
             V vert (A i)
             {
@@ -54,7 +78,8 @@ Shader "ReflectAR/DepthOnly"
                 vs.z -= _DepthPush;                 // view space looks down -z: further from the viewer
                 o.pos = TransformWViewToHClip(vs);
                 o.n = TransformObjectToWorldNormal(i.n);
-                o.body = mul(_ReflectARWorldToBody, float4(w, 1)).xyz - _MaskOffset.xyz;
+                o.bodyNow = mul(_ReflectARWorldToBody, float4(w, 1)).xyz;
+                o.body = o.bodyNow - _MaskOffset.xyz;
                 return o;
             }
 
@@ -62,6 +87,7 @@ Shader "ReflectAR/DepthOnly"
             {
                 if (_UseMask > 0.5)
                 {
+                    clip(OverGarment(i.bodyNow) ? -1 : 1);
                     float3 q = mul(_ReflectARMaskMatrix, float4(i.body, 1)).xyz;
                     float2 uv = q.xy / max(q.z, 1e-4);
                     bool inside = q.z > 0 && all(uv > 0) && all(uv < 1);
@@ -91,6 +117,26 @@ Shader "ReflectAR/DepthOnly"
         float4x4 _ReflectARWorldToBody;    // world -> body coords (MirrorWorld local: the unreflected body)
         float _ReflectARMaskThreshold;
         float _ReflectARFeedOn;            // CameraFeed mode: feed brightness (its _Dim), else 0
+        float4 _ReflectARCoverA[12], _ReflectARCoverB[12];   // garment outline capsules: ends (body coords), A.w = radius
+        float _ReflectARCoverCount;
+        float4 _ReflectARCamBody;          // the viewpoint in body coords
+
+        // Does the view ray through body point p pass through the garment outline?
+        bool OverGarment (float3 p)
+        {
+            float3 o = _ReflectARCamBody.xyz, d = normalize(p - o);
+            for (int k = 0; k < 12; k++)
+            {
+                if (k >= (int)_ReflectARCoverCount) break;
+                float3 a = _ReflectARCoverA[k].xyz, ab = _ReflectARCoverB[k].xyz - a, ao = a - o;
+                float de = dot(d, ab), ee = dot(ab, ab), den = ee - de * de;
+                float s = den > 1e-8 ? saturate((dot(d, ao) * de - dot(ab, ao)) / den) : 0;
+                float3 w = a + ab * s - o;             // segment point closest to the ray, from the eye
+                float t = dot(w, d), r = _ReflectARCoverA[k].w;
+                if (dot(w, w) - t * t < r * r) return true;
+            }
+            return false;
+        }
 
         struct A { float4 pos : POSITION; float3 n : NORMAL; };
         struct V { float4 pos : SV_POSITION; float3 n : TEXCOORD0; float3 body : TEXCOORD1; float3 bodyNow : TEXCOORD2; };
@@ -118,6 +164,7 @@ Shader "ReflectAR/DepthOnly"
         {
             if (_UseMask > 0.5)
             {
+                clip(OverGarment(i.bodyNow) ? -1 : 1);
                 float3 q = mul(_ReflectARMaskMatrix, float4(i.body, 1)).xyz;
                 float2 uv = q.xy / max(q.z, 1e-4);
                 bool inside = q.z > 0 && all(uv > 0) && all(uv < 1);
