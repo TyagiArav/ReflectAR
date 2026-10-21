@@ -5,8 +5,16 @@ model is translated from its OpenVINO IR by tools/ir_to_onnx.py instead.
 Needs a separate environment (TensorFlow pins an older numpy):
 
     python3.11 -m venv .venv-convert
-    .venv-convert/bin/pip install "tensorflow-cpu==2.17.*" "tf2onnx==1.16.1" "numpy<2" onnx
+    .venv-convert/bin/pip install "tensorflow-cpu==2.17.*" "tf2onnx==1.16.1" "numpy<2" onnx onnxconverter-common
     .venv-convert/bin/python tools/convert_models.py           # from perception/
+
+Each model is written twice, both post-processed for Core ML (see `for_coreml`):
+  <name>.onnx       float32: CPU, Core ML GPU, CUDA / TensorRT / DirectML
+  <name>_fp16.onnx  float16 inside, float32 in/out: the Neural Engine runs only fp16 ops, so
+                    Core ML puts an fp32 model on its CPU path even with MLComputeUnits=CPUAndNeuralEngine.
+                    Landmarks move by ~0.7-0.9 px on 1280x720 frames vs fp32 (visible joints).
+`--from-onnx` redoes only that post-processing on the existing .onnx (needs just onnx +
+onnxconverter-common, no TensorFlow).
 
 pose_detection.tflite stores most weights as sparse fp16 tensors expanded by a DENSIFY op,
 which tf2onnx can't read; they are densified here before conversion. Outputs were checked
@@ -17,6 +25,65 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS = os.path.join(HERE, "..", "models")
+
+
+# ------------------------------------------------------------------ Core ML fixes
+def explicit_pads(model):
+    """tf2onnx leaves `pads` off Conv / MaxPool that follow an explicit Pad (TF "VALID").
+    ONNX Runtime's Core ML EP (checked up to 1.31) then emits no `pad` param and the ML Program
+    fails to compile ("Required param 'pad' is missing"), so the model falls back to the CPU."""
+    from onnx import helper
+    for n in model.graph.node:
+        names = {a.name for a in n.attribute}
+        if n.op_type in ("Conv", "MaxPool", "AveragePool") and not names & {"pads", "auto_pad"}:
+            rank = len(next(a.ints for a in n.attribute if a.name == "kernel_shape"))
+            n.attribute.append(helper.make_attribute("pads", [0] * 2 * rank))
+    return model
+
+
+def to_fp16(model):
+    """Float16 weights and activations (Neural Engine), float32 inputs / outputs."""
+    import onnx
+    from onnx import numpy_helper
+    from onnxconverter_common import float16
+    # Resize is blocked by default; an fp32 island splits the graph and the ANE compiler then
+    # rejects pose_landmark_full, so convert it too and keep only its roi / scales in fp32.
+    block = [op for op in float16.DEFAULT_OP_BLOCK_LIST if op != "Resize"]
+    model = float16.convert_float_to_float16(model, keep_io_types=True, op_block_list=block)
+    inits = {t.name: t for t in model.graph.initializer}
+    for n in model.graph.node:
+        for k in (1, 2) if n.op_type == "Resize" else ():
+            t = inits.get(n.input[k]) if k < len(n.input) else None
+            if t is not None and t.data_type == onnx.TensorProto.FLOAT16:
+                name = t.name + "_fp32"
+                if name not in inits:
+                    inits[name] = numpy_helper.from_array(numpy_helper.to_array(t).astype(np.float32), name)
+                    model.graph.initializer.append(inits[name])
+                n.input[k] = name
+    used = {i for n in model.graph.node for i in n.input}
+    keep = [t for t in model.graph.initializer if t.name in used]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(keep)
+    return model
+
+
+def save_for_coreml(model, path):
+    """Saves with a content hash as COREML_CACHE_KEY: ONNX Runtime keys its Core ML cache by the
+    model path otherwise, so a regenerated model would load the stale compiled program."""
+    import hashlib, onnx
+    del model.metadata_props[:]
+    onnx.checker.check_model(model, full_check=True)
+    key = hashlib.sha256(model.SerializeToString()).hexdigest()[:32]
+    onnx.helper.set_model_props(model, {"COREML_CACHE_KEY": key})
+    onnx.save(model, path)
+
+
+def for_coreml(name):
+    import onnx
+    src = os.path.join(MODELS, f"{name}.onnx")
+    model = explicit_pads(onnx.load(src))
+    save_for_coreml(model, src)
+    save_for_coreml(to_fp16(model), os.path.join(MODELS, f"{name}_fp16.onnx"))
 
 
 # ------------------------------------------------------------------ tflite
@@ -110,11 +177,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--only", choices=["pose_detection", "pose_landmark_full", "hand_landmark_full"])
+    ap.add_argument("--from-onnx", action="store_true", help="only redo the Core ML post-processing")
     args = ap.parse_args()
     for name in ("pose_detection", "pose_landmark_full", "hand_landmark_full"):
         if args.only in (None, name):
             print(f"[convert] {name}")
-            convert_tflite(os.path.join(MODELS, f"{name}.tflite"), os.path.join(MODELS, f"{name}.onnx"), args.opset)
+            if not args.from_onnx:
+                convert_tflite(os.path.join(MODELS, f"{name}.tflite"), os.path.join(MODELS, f"{name}.onnx"), args.opset)
+            for_coreml(name)
 
 
 if __name__ == "__main__":

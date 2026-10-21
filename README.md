@@ -32,7 +32,7 @@ The system has two programs that talk over a local TCP socket:
 | **One-Euro filter + constant-velocity Kalman filter** | Smoothing joints and predicting pose ahead in time (`filters.py`) |
 | **TensorFlow + tf2onnx, ONNX** | Only used by `tools/` to convert the original models to `.onnx`. Not needed to run ReflectAR |
 
-All model files are already committed in `perception/models/`, in two forms: `.onnx` for ONNX Runtime, and the originals (`.tflite`, plus the OpenVINO IR `.xml`/`.bin` for depth) for OpenVINO. Nothing has to be downloaded.
+All model files are already committed in `perception/models/`, in two forms: `.onnx` for ONNX Runtime, and the originals (`.tflite`, plus the OpenVINO IR `.xml`/`.bin` for depth) for OpenVINO. The pose and hand models also have a `_fp16.onnx` copy for the Apple Neural Engine. Nothing has to be downloaded.
 
 ### Renderer (`renderer/`)
 
@@ -248,7 +248,7 @@ Absolute distance from one camera is approximate (±10–20 %). Fusion helps, bu
 
 ## How it works
 
-- **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because Unity doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
+- **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because Unity doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px in float32. The Neural Engine only runs float16, so on `ane` the pose and hand models load from their `_fp16.onnx` copies; Core ML would otherwise run a float32 model on its CPU path. Those copies move pose landmarks by ~0.7–1 px on 1280×720 frames (visible joints) and hand landmarks by ~0.1 px. Set `pose_device` to `gpu` for float32 on the Apple GPU instead. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
 - **Pose:** the stock MediaPipe BlazePose *full* detector and landmark models, with MediaPipe's ROI tracking re-implemented (`blazepose.py`). Each joint's 3D position comes from back-projecting its 2D pixel at a fused distance, plus BlazePose's relative per-joint depth, so the skeleton always lands exactly on the person in the image (`geometry.py`, `server.py`).
 - **Depth from one camera:** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 2 Hz (`compute.depth_max_hz`; 0.5 Hz when nobody is in view) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
 - **Gestures:** `gestures.py`. A swipe is the wrist crossing ≥ 0.9 shoulder-widths horizontally within 0.9 s, measured on the raw 2D image relative to the shoulders, so it's independent of distance and has no filter lag. Arcing strokes are fine as long as horizontal motion dominates, and blurry frames are tolerated. With `--log`, every candidate stroke prints a `[swipe?] … reject` line with the reason. Fist = MediaPipe hand-landmark model on a crop around the raised wrist (`handpose.py`), with finger-curl ratios. A fist held still blocks swipes.
@@ -274,12 +274,13 @@ Measured on an M5 Pro while tracking one person (CPU, 100 % = one core). The "be
 
 | | Before | After |
 |---|---|---|
-| Perception | ~970 % | ~120–170 % on the CPU; less with Core ML, which puts the models on the Neural Engine |
+| Perception | ~970 % | ~120–170 % with pose on the CPU; about half that with pose on the Neural Engine |
 | Renderer | 85–220 % (Editor, Play mode) | ~55 % (standalone app) |
 | Worst frame | up to 533 ms (garment rebuild on the main thread) | ~22 ms |
 
 What made the difference:
 - **Depth model:** runs at 2 Hz (`compute.depth_max_hz`), and 0.5 Hz with nobody in view (`depth_idle_hz`). It only feeds the user distance, which is smoothed at < 1 Hz.
+- **Pose on the Neural Engine:** the pose and hand models run as float16 on the Neural Engine (pose 9.7 → ~3 ms per frame, hands 6.4 → ~2 ms). Replaying a 1280×720 clip at 30 fps, perception went from 109–114 % to 53–54 % CPU.
 - **CPU thread budgets:** 2 threads each for pose and depth when they run on the CPU (`pose_threads`, `depth_threads`); big pools spin and burn power for ~1 ms of latency.
 - **Idle mode:** with nobody in view for 3 s, person detection drops to 6 fps (`idle_pose_fps`).
 - **Camera image:** sent raw over localhost instead of as JPEG.
