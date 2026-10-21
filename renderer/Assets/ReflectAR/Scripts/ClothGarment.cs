@@ -238,6 +238,18 @@ namespace ReflectAR
             colliders.Add(new Capsule(body.ShC, body.HeadC - body.Up * 0.04f * u, 0.055f * u));
         }
 
+        /// <summary>How far the cloth may stand off the body (ease plus drape), with a little to spare.</summary>
+        public float Room => ((0.03f + spec.ease) * spec.drape + 0.01f) * body.Unit;
+
+        /// <summary>Where the garment covers the torso: its torso and shoulder colliders grown by
+        /// <see cref="Room"/>. The occlusion prepass keeps oversized occluders off this area.</summary>
+        public void Outline(List<Capsule> into)
+        {
+            float room = Room;
+            for (int i = 0; i < 6 && i < colliders.Count; i++)      // 5 torso levels + the shoulder line
+                into.Add(new Capsule(colliders[i].a, colliders[i].b, colliders[i].r + room));
+        }
+
         // ---------------------------------------------------------------- simulation
         public void Step(float dt)
         {
