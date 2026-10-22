@@ -102,7 +102,9 @@ namespace ReflectAR
         /// <summary>URP: colour in rgb, weave height in alpha (one texture = one repeat).</summary>
         public static Texture2D Make(GarmentSpec s)
         {
-            if (cache.TryGetValue(s.name, out var t)) return t;
+            // Play mode starts without a domain reload (Enter Play Mode Options), so this static cache
+            // outlives the textures Unity destroys when Play mode stops: rebuild those.
+            if (cache.TryGetValue(s.name, out var t) && t != null) return t;
             const int N = 256;
             t = new Texture2D(N, N, TextureFormat.RGBA32, true)
                 { wrapMode = TextureWrapMode.Repeat, filterMode = FilterMode.Trilinear, anisoLevel = 8 };
@@ -193,7 +195,8 @@ namespace ReflectAR
 
         public static FabricMaps Make(GarmentSpec s)
         {
-            if (cache.TryGetValue(s.name, out var m)) return m;
+            // see PatternTex.Make: textures from an earlier Play session are destroyed by now
+            if (cache.TryGetValue(s.name, out var m) && m.baseColor != null && m.normal != null && m.mask != null) return m;
             const int N = 512;
             var col = new Color[N * N];
             var h = new float[N * N];
