@@ -249,7 +249,7 @@ namespace ReflectAR
             bool feedOn = mode == ViewMode.CameraFeed && f != null && f.cam != null && f.cam.fx > 0;
             Shader.SetGlobalTexture("_ReflectARFeed", client.Feed);
             Shader.SetGlobalFloat("_ReflectARFeedOn", feedOn ? (f.range == "ok" || !f.tracked ? 1f : 0.6f) : 0f);
-            proxy.Update(body, body.Valid && visible > 0f, showProxy, specs[current].tank ? 0f : specs[current].sleeve, maskOn ? maskJoints : null);
+            proxy.Update(body, body.Valid && visible > 0f, showProxy, specs[current].tank ? 0f : specs[current].sleeve, maskOn ? maskJoints : null, g);
             UpdateFeedQuad(f);
             cube.SetActive(cubeTest && mode == ViewMode.Mirror);
             if (cube.activeSelf && f != null && f.screen != null)
@@ -264,6 +264,8 @@ namespace ReflectAR
             if (f == null || f.cam == null || f.cam.fx <= 0) return;
             if (mode == ViewMode.CameraFeed) ApplyFeedCamera(f.cam);
             else ApplyOffAxis(f.screen, hadBody ? client.Eye : DefaultEye(f.screen));
+            // the viewpoint in body coords, for the occlusion prepass (ReflectAR_DepthOnly.shader)
+            Shader.SetGlobalVector("_ReflectARCamBody", mirrorWorld.InverseTransformPoint(cam.transform.position));
         }
 
         static Vector3 DefaultEye(ScreenInfo s) => new Vector3(s.w_m / 2, s.h_m / 2 + 0.25f, -1.5f);

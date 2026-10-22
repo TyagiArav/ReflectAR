@@ -20,6 +20,9 @@ FILES = {  # name: (onnx, openvino)
     "depth": ("da2_metric_indoor_small.onnx", "da2_metric_indoor_small.xml"),
 }
 GPU_EPS = ("TensorrtExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider")
+# The Neural Engine only runs fp16 ops: given an fp32 model, Core ML quietly uses its CPU path.
+# These float16 copies (float32 in/out) come from tools/convert_models.py.
+ANE_FILES = {name: f"{name}_fp16.onnx" for name in ("pose_detection", "pose_landmark_full", "hand_landmark_full")}
 
 
 def resolve_device(device, available):
@@ -137,12 +140,15 @@ class Backend:
         use_ov = self.kind == "openvino" or (device == "cpu" and self.core is not None)
         if not use_ov and not os.path.exists(os.path.join(MODEL_DIR, onnx_file)):
             raise FileNotFoundError(f"{onnx_file} missing; see tools/convert_models.py / tools/ir_to_onnx.py")
+        if device == "ane" and "CoreMLExecutionProvider" in self.available and name in ANE_FILES \
+                and os.path.exists(os.path.join(MODEL_DIR, ANE_FILES[name])):
+            onnx_file = ANE_FILES[name]
         if use_ov:
             m = OpenVinoModel(self.core, os.path.join(MODEL_DIR, ov_file), self._ov_config(threads))
         else:
             m = OnnxModel(self.ort, os.path.join(MODEL_DIR, onnx_file),
                           onnx_providers(device, self.available), threads)
-        self.loaded[name] = m.provider
+        self.loaded[name] = m.provider + (" fp16" if onnx_file.endswith("_fp16.onnx") else "")
         return m
 
     def summary(self):
