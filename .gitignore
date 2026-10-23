@@ -7,27 +7,5 @@ __pycache__/
 .venv/
 perception/models/cache/
 
-# Unity
-renderer/[Ll]ibrary/
-renderer/[Tt]emp/
-renderer/[Oo]bj/
-renderer/[Bb]uild/
-renderer/[Bb]uilds/
-renderer/[Ll]ogs/
-renderer/[Uu]ser[Ss]ettings/
-renderer/[Mm]emoryCaptures/
-renderer/.vs/
-renderer/.idea/
-renderer/*.csproj
-renderer/*.sln
-renderer/*.slnx
-renderer/*.unityproj
-renderer/*.pidb
-renderer/*.booproj
-renderer/*.svd
-renderer/*.pdb
-renderer/*.mdb
-renderer/*.apk
-renderer/*.aab
-renderer/crashlytics-build.properties
-renderer/Assets/Screenshots/
+# Unreal (see also unreal/.gitignore)
+unreal/Build/

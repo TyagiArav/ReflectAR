@@ -7,10 +7,9 @@ v1 is a computer prototype: it runs on the computer's own camera and screen. It 
 The system has two programs that talk over a local TCP socket:
 
 ```
- webcam ──► perception/ (Python)  ──TCP 127.0.0.1:5566──►  renderer/ (Unity)  ──► screen
+ webcam ──► perception/ (Python)  ──TCP 127.0.0.1:5566──►  unreal/ (Unreal Engine 5)  ──► screen
             pose, hands, depth,                             off-axis camera, cloth
             gestures, filtering                             garments, occlusion, UI
-                                                            (HDRP or URP)
 ```
 
 ---
@@ -34,20 +33,22 @@ The system has two programs that talk over a local TCP socket:
 
 All model files are already committed in `perception/models/`, in two forms: `.onnx` for ONNX Runtime, and the originals (`.tflite`, plus the OpenVINO IR `.xml`/`.bin` for depth) for OpenVINO. The pose and hand models also have a `_fp16.onnx` copy for the Apple Neural Engine. Nothing has to be downloaded.
 
-### Renderer (`renderer/`)
+### Renderer (`unreal/`)
 
 | Technology | What it's used for |
 |---|---|
-| **Unity 6 (6000.6.6f1)** | The real-time renderer and app |
-| **High Definition Render Pipeline (HDRP) 17.6** | Default look: `HDRP/Lit` fabrics, soft shadows, SSAO and contact shadows (`HdrpLook.cs`, `GarmentMaterials.cs`) |
-| **Universal Render Pipeline (URP) 17.6** | Lighter alternative, switchable from the *ReflectAR > Render Pipeline* menu; custom shaders `ReflectAR_Garment`, `ReflectAR_Feed`, `ReflectAR_DepthOnly` |
-| **Unity Input System 1.20** | Keyboard controls |
-| **uGUI** | On-screen prompts and the garment carousel |
-| **C#** | Everything in `Assets/ReflectAR/Scripts/` |
-| **Kooima off-axis projection** | Renders the scene from the tracked eye position, as a mirror would show it |
-| **Signed-distance fields + surface nets** | Generates each garment as one seamless mesh fitted to the user (`GarmentMesher.cs`) |
-| **XPBD cloth simulation** | Custom position-based cloth solver with body-capsule collisions (`ClothGarment.cs`) |
-| **Mask-trimmed depth occluders** | Hide the garment behind your hands, arms and head, trimmed per pixel to the person mask (`BodyProxy.cs`) |
+| **Unreal Engine 5.6+** | The real-time renderer and app (C++ project, no Blueprints) |
+| **C++** | Everything in `Source/ReflectAR/` |
+| **Procedural Mesh Component** | The simulated garments, their closures, the body occluders and the camera feed, rebuilt every frame |
+| **Cloth shading model, virtual shadow maps, contact shadows** | Fabric with sheen and weave normal maps, soft shadows from a 3000 lux key light |
+| **Python Editor Script Plugin** | `Content/Python/reflectar_setup.py` builds the materials on the first editor start |
+| **Canvas HUD** | On-screen prompts and the garment carousel |
+| **Kooima off-axis projection** | Renders the scene from the tracked eye position, as a mirror would show it (`UMirrorLocalPlayer`) |
+| **Signed-distance fields + surface nets** | Generates each garment as one seamless mesh fitted to the user (`GarmentMesher.cpp`) |
+| **XPBD cloth simulation** | Custom position-based cloth solver with body-capsule collisions (`ClothGarment.cpp`) |
+| **Mask-trimmed occluders** | Hide the garment behind your hands, arms and head, trimmed per pixel to the person mask (`BodyProxy.cpp`, `M_Proxy`) |
+
+The renderer was a Unity 6 project (HDRP / URP) until this port; it is in the git history (`main` before the Unreal branch) if you need it.
 
 ---
 
@@ -57,7 +58,7 @@ All model files are already committed in `perception/models/`, in two forms: `.o
 ReflectAR/
 ├── run_perception.sh            # starts the perception service (macOS / Linux)
 ├── run_perception.bat           # starts the perception service (Windows)
-├── run_mirror.sh                # macOS: perception + the standalone app (lowest CPU / battery)
+├── run_mirror.sh                # macOS: perception + the packaged app (lowest CPU / battery)
 ├── perception/
 │   ├── requirements.txt         # Python dependencies, with the right runtime per platform
 │   ├── server.py                # main service: webcam → tracking → TCP stream
@@ -73,11 +74,14 @@ ReflectAR/
 │   ├── calib/                   # config.json (all tuning) + depth_calib.json
 │   ├── models/                  # .onnx, .tflite and OpenVINO IR model files
 │   └── tools/                   # model converters (only needed if a model changes)
-└── renderer/                    # Unity project
-    └── Assets/ReflectAR/
-        ├── ReflectAR.unity      # the main scene
-        ├── Scripts/             # MirrorApp, TrackingClient, BodyRig, BodyProxy, garments, UI
-        └── Resources/           # shaders
+└── unreal/                      # Unreal Engine 5 project
+    ├── ReflectAR.uproject
+    ├── Config/                  # game mode, local player, renderer settings
+    ├── Content/Python/          # reflectar_setup.py: builds the materials (Content/ReflectAR/)
+    └── Source/ReflectAR/
+        ├── Public/, Private/    # ReflectARMirror (the app), TrackingClient, BodyRig, BodyProxy,
+        │                        # GarmentMesher, ClothGarment, GarmentTrims, GarmentSpec, HUD
+        └── ReflectAR.Build.cs
 ```
 
 ---
@@ -88,7 +92,7 @@ ReflectAR/
 
 - **Git**
 - **Python 3.11 or newer**, 64-bit (tested with 3.11 and 3.13)
-- **Unity Hub** and **Unity 6000.6.6f1**. Install it from Unity Hub → *Installs* → *Install Editor* (use the *Archive* tab if that exact version isn't listed). A newer 6000.x editor will usually upgrade the project fine.
+- **Unreal Engine 5.6 or newer** (Epic Games Launcher → *Unreal Engine* → *Library*), and a C++ toolchain: **Xcode** on macOS, **Visual Studio 2022** with the *Game development with C++* workload on Windows. The project is C++, so the editor compiles it on first open. A newer 5.x engine should open it after a one-time conversion prompt.
 - A webcam, optional: you can test everything without one (see [Running without a camera](#running-without-a-camera)).
 - For accelerated inference, one of:
   - a Mac with **macOS 14+** (Apple Silicon) for Core ML,
@@ -148,12 +152,11 @@ Quick check that the models load (run from `perception/`; on Windows use `.venv\
 
 It prints which device each model ended up on, for example `pose_landmark_full=CoreML`, `=CUDA` or `=OpenVINO CPU`.
 
-### 4. Open the Unity project
+### 4. Open the Unreal project
 
-1. Open Unity Hub → *Projects* → *Add* → *Add project from disk*, and choose the `renderer/` folder (not the repository root).
-2. Open it with Unity 6000.6.6f1. The first import takes a few minutes while Unity regenerates `Library/`. The packages in `Packages/manifest.json` (HDRP, URP, Input System, uGUI) download automatically.
-3. In the Project window, open `Assets/ReflectAR/ReflectAR.unity`.
-4. The first time the project opens with HDRP installed, `Editor/PipelineSetup.cs` creates `Assets/Settings/HDRP/ReflectAR_HDRP.asset`, makes HDRP the active pipeline and writes the garment material templates to `Resources/HDRP/`. **ReflectAR > Render Pipeline > URP / HDRP** switches between the two (the URP assets are kept). If HDRP complains about missing settings, run **Window > Rendering > HDRP Wizard > Fix All** once.
+1. Open `unreal/ReflectAR.uproject` (double-click, or *Browse* in the launcher). Unreal asks to build the `ReflectAR` module: choose **Yes**. On macOS you can instead run *Generate Xcode Project* from the `.uproject`'s context menu and build the `ReflectAREditor` target.
+2. On the first editor start, `Content/Python/init_unreal.py` runs `reflectar_setup.py`, which writes the materials and the parameter collection to `Content/ReflectAR/` (the Output Log shows `ReflectAR setup: materials written to /Game/ReflectAR`). They are generated, not committed; to rebuild them, run `import importlib, reflectar_setup; importlib.reload(reflectar_setup); reflectar_setup.build()` in the Output Log's Python console.
+3. Nothing else needs setting up: the project opens an empty map, and `AReflectARGameMode` spawns the mirror (`AReflectARMirror`), its lights and its HUD when you press Play.
 
 ### 5. Camera permissions
 
@@ -166,7 +169,7 @@ The camera API is chosen automatically (AVFoundation on macOS, Media Foundation 
 
 ## Running
 
-Start the two halves in either order. The Unity app waits for perception and connects on its own.
+Start the two halves in either order. The Unreal app waits for perception and connects on its own.
 
 **1. Start perception**
 
@@ -179,9 +182,9 @@ Both run `server.py --log` from inside `perception/`, and pass any extra flags t
 
 Startup prints a `[backend] …` line saying which device each model runs on, a `[cam] …` line, and `[net] listening on 127.0.0.1:5566`. The first start also compiles the models (Core ML: seconds; TensorRT: minutes). Later starts use the cache in `perception/models/cache/`.
 
-**2. Start the renderer:** in Unity, with `ReflectAR.unity` open, press **Play**.
+**2. Start the renderer:** in the Unreal editor press **Play** (*Selected Viewport*, or *New Editor Window* for a window you can resize to the screen).
 
-**Lowest CPU / battery (macOS):** build the app once (Unity: *File > Build Profiles > macOS*, output `renderer/Builds/ReflectAR.app`), then run `./run_mirror.sh`. It starts perception and the app together, and stops perception when you quit the app with **Esc**. The Unity Editor redraws its own windows every frame: in Play mode it measured 85–220 % CPU against ~55 % for the app.
+**Lowest CPU / battery (macOS):** package the app once (*Platforms > Mac > Package Project*, into `unreal/Build/`, which gives `unreal/Build/Mac/ReflectAR.app`), then run `./run_mirror.sh`. It starts perception and the app together, and stops perception when you quit the app with **Esc**. The editor redraws its own windows every frame, so the packaged app uses much less CPU.
 
 Stand **1–3 m** from the screen. Outside that range a prompt shows ("Please step back" / "Come a little closer"), garments dim, and gestures are disabled.
 
@@ -192,7 +195,7 @@ Stand **1–3 m** from the screen. Outside that range a prompt shows ("Please st
 | `--log` | Print tracking state every second, plus a `[swipe?] … reject` line explaining every rejected swipe |
 | `--snapshot dbg.jpg` | Write an annotated debug frame every second |
 | `--video file.mp4` | Replay a recording instead of the webcam |
-| `--no-image` | Don't stream the camera image to Unity |
+| `--no-image` | Don't stream the camera image to the renderer |
 | `--calib-dist <m>` | Distance calibration (see below); exits when done |
 | `--ep-log` | Show how much of each model Core ML / TensorRT took and what fell back to the CPU |
 | `--config <path>` | Use a different config file (default `calib/config.json`) |
@@ -209,7 +212,7 @@ cd perception
 .venv/bin/python fake_server.py --dist 0.8        # stand too close, to test range prompts
 ```
 
-Then press Play in Unity.
+Then press Play in Unreal.
 
 ---
 
@@ -224,9 +227,9 @@ Then press Play in Unity.
 | Pose prediction on / off (A/B test) | – | P |
 | Occlusion trimmed to the person mask on / off (A/B test) | – | O |
 | Prediction lead −5 / +5 ms (Mirror mode) | – | [ / ] |
-| Quit (in a build) | – | Esc |
+| Quit | – | Esc |
 
-There are 10 upper-body garments (`GarmentCatalog.cs`): tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer and tank.
+There are 10 upper-body garments (`GarmentSpec.cpp`): tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer and tank. The same toggles (and the light levels `KeyLux`, `FillLux`, `Ambient`) are properties of `AReflectARMirror`, editable in the *Details* panel while playing.
 
 ---
 
@@ -239,7 +242,7 @@ All tuning lives in `perception/calib/config.json`. Each section has a `_note` e
 - **Camera intrinsics (recommended):** print a 9×6 inner-corner checkerboard, measure one square, then run `.venv/bin/python calibrate_intrinsics.py --square <metres>` from `perception/`. Show the board at 15–25 angles and distances, pressing SPACE for each one, then press Q to solve. This writes `calib/intrinsics.json`. Until you do, the field of view comes from `camera.hfov_deg`.
 - **Screen and camera position:** `screen` (physical size in metres and resolution) and `camera_pose` (the camera's position relative to the screen's lower-left corner) default to a 14" MacBook Pro. Measure and change them for any other display, including the 43" mirror build.
 - **Camera:** `camera.index` picks the camera if the wrong one opens, and `camera.api` the capture API (see [Camera permissions](#5-camera-permissions)).
-- **Occlusion mask:** `net.mask_width` is the resolution of the person mask sent to Unity (0 turns it off).
+- **Occlusion mask:** `net.mask_width` is the resolution of the person mask sent to the renderer (0 turns it off).
 - **Prediction lead (optional, Mirror mode):** wave a hand and press [ / ] until the garment stops trailing or leading the reflection. Then add the shown lead to `camera.latency_s` (or `predict.display_latency_s`).
 
 Absolute distance from one camera is approximate (±10–20 %). Fusion helps, but a real stereo or ToF camera is the target for the mirror build.
@@ -248,29 +251,29 @@ Absolute distance from one camera is approximate (±10–20 %). Fusion helps, bu
 
 ## How it works
 
-- **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because Unity doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px in float32. The Neural Engine only runs float16, so on `ane` the pose and hand models load from their `_fp16.onnx` copies; Core ML would otherwise run a float32 model on its CPU path. Those copies move pose landmarks by ~0.7–1 px on 1280×720 frames (visible joints) and hand landmarks by ~0.1 px. Set `pose_device` to `gpu` for float32 on the Apple GPU instead. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
+- **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because the renderer doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px in float32. The Neural Engine only runs float16, so on `ane` the pose and hand models load from their `_fp16.onnx` copies; Core ML would otherwise run a float32 model on its CPU path. Those copies move pose landmarks by ~0.7–1 px on 1280×720 frames (visible joints) and hand landmarks by ~0.1 px. Set `pose_device` to `gpu` for float32 on the Apple GPU instead. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
 - **Pose:** the stock MediaPipe BlazePose *full* detector and landmark models, with MediaPipe's ROI tracking re-implemented (`blazepose.py`). Each joint's 3D position comes from back-projecting its 2D pixel at a fused distance, plus BlazePose's relative per-joint depth, so the skeleton always lands exactly on the person in the image (`geometry.py`, `server.py`).
 - **Depth from one camera:** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 2 Hz (`compute.depth_max_hz`; 0.5 Hz when nobody is in view) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
 - **Gestures:** `gestures.py`. A swipe is one fast, mostly sideways stroke of the hand (wrist, index and pinky combined, so one blurred landmark doesn't break it), measured on the raw 2D image relative to the shoulders, so it's independent of distance and has no filter lag. It fires mid-stroke once the hand has covered 0.8 shoulder widths with a peak speed of 1.8 shoulder widths/s. Moving the hand back is not a swipe: a stroke the other way only counts once the hand has been still for 0.6 s, and within 3 s of a swipe only if it's at least 80 % as fast. `swipe_direction` is `natural` (scrolling: move the hand right to bring in the item on the left) or `pointer`. With `--log`, rejected strokes print a `[swipe?] … reject` line with the reason. On a synthetic benchmark of realistic swipes, returns, double swipes and non-swipe hand motion, 96 % of swipe cases and 98 % of non-swipe cases come out right (previous detector: 86 % / 94 %; its main failure was the way back firing as an opposite swipe). Fist = MediaPipe hand-landmark model on a crop around the raised wrist (`handpose.py`), with finger-curl ratios. A fist held still blocks swipes.
-- **Latency / pose prediction:** perception sends each frame's joints *with velocities* at the frame's capture time (`filters.PosePredictor`: One-Euro at rest, a constant-velocity Kalman filter once a joint moves). Every render frame, `TrackingClient.Predict` extrapolates them to the moment that frame reaches the screen, so the garment sits on where the body is now, not where it was ~80 ms ago, and moves at the render rate rather than in 30 Hz steps. In *CameraFeed* mode the overlay is instead matched to the capture time of the image shown under it. Clocks are synced from each frame's send time. Measured end to end with a known trajectory and 60 ms latency: fast-motion error halves (110 → 55 mm), slow motion −20 %, rest jitter < 1 mm/frame. The rest of the pipeline was cut too: JSON goes out before the camera image, the fist classifier runs on its own thread, and pose and depth get separate OpenVINO thread budgets. Together these took capture→Unity from 141 ms to 19 ms on a 4-core test box. Tuning lives in `predict`, `filters` and `camera.latency_s` in `calib/config.json`. Debug line (D) shows latency and prediction horizon.
-- **Occlusion (`BodyProxy.cs`, `ReflectAR_DepthOnly.shader`):** depth-only stand-ins for the body hide whatever of the garment is behind it. Parts under the garment (torso, neck, sleeved arm) are fitted capsules. Exposed parts (bare forearms, hands with fingers, head with hair) are drawn oversized, then trimmed per pixel to the person mask that BlazePose's landmark model produces (sent with each frame, `net.mask_width`): each fragment is projected into the camera image and dropped where the mask says there is no person, so the cut-out follows the real silhouette. The lookup uses where that body part was when the mask was captured, so prediction doesn't tear it, and it works in both modes. Oversized parts are pushed back by their oversize so they can't poke through sleeves or the collar. On the test clip it covers 99 % of the real hands, forearms and head (capsules alone: 87 %), and occluder pixels off the body drop from 35 % to 7 %. B shows the proxies (trimmed parts tinted warm).
-- **Wire format:** TCP, with Python as the server. Each message is 1 type byte, a 4-byte big-endian length, then the payload: `J` = JSON tracking frame; `R` = float64 capture time + uint16 width + uint16 height + RGB24 camera image (rows bottom first); `M` = float64 capture time + uint16 width + uint16 height + the person mask (uint8, 255 = person). Unity still accepts the older `I` (float64 capture time + JPEG). The image goes raw because on one machine that's far cheaper than a JPEG encode plus a decode on Unity's main thread.
-- **Render pipelines (`HdrpLook.cs`, `GarmentMaterials.cs`):** the scene is set up at runtime for whichever pipeline is active. Under **HDRP**, garments are `HDRP/Lit` (opaque, double-sided) with per-fabric base colour, weave normal map and mask map (AO in the weave's valleys, smoothness per fibre: fleece 0.1, denim 0.2, nylon 0.5–0.6). They get a 3000 lux key light with soft shadows (6° angular diameter), a 700 lux fill, ambient from a soft gradient "room", SSAO and contact shadows. The body proxies cast shadows and are in the depth buffer, so hands, arms and the head shade the garment. Fixed exposure (EV100 10) and neutral tonemapping; the feed and proxy shaders divide the exposure back out, so the camera image keeps its brightness. SMAA instead of TAA (cloth has no motion vectors, so TAA would smear it), and no bloom or dithering, so black stays black on the mirror. While a garment fades in or out it switches to a transparent copy of its material. Under **URP** everything renders as before with the `ReflectAR/Garment` triplanar shader.
-  - In HDRP the camera feed is drawn after the depth prepass, so it can't show through the proxies' depth; the proxies' colour pass draws the feed pixel they cover instead (`ReflectAR_DepthOnly.shader`).
-- **Renderer:** `MirrorApp.cs` has two modes. *CameraFeed* places a virtual camera at the webcam pose with its intrinsics, mirrored, over the live camera feed. *Mirror* renders the reflected `MirrorWorld` with a Kooima off-axis frustum from the tracked eye; this is the mode the two-way-mirror build will use.
-- **Garments (upper body only):** 10 tops in `GarmentCatalog.cs`: tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer, tank.
-  - *Body shape* (`BodyShape.cs`): the torso is measured from the person mask at six heights between the hips and the shoulders. It walks the mask outward from the torso's centre line to the silhouette edge, then averages the ratio to the generic body over ~1.5 s into `BodyRig.Profile`. A side is skipped while its arm touches the torso (that edge would be the arm), so it measures whenever an arm is away from the body, for example while swiping. Nothing is measured unless the user faces the camera (±25°). Wider also means deeper (60 % of the width change), for chest and belly. Garments rebuild in the background when a level changes by more than 8 % for 1.5 s.
-  - *Mesh* (`GarmentMesher.cs`): each garment is generated per user as one seamless surface. A signed-distance field smoothly blends the torso, shoulders, sleeves and collar, so armpits and shoulders have no gaps. It is meshed with surface nets and cut open at the neck, hem and cuffs. The torso cross-section follows the measured body plus ease. Below the chest it hangs from whatever is widest above it (chest or belly) by `fit` (tank 0.15, tee 0.75, hoodie 0.95), the way fabric falls instead of tucking into the waist. Ribbed hem bands (hoodie, bomber, puffer) pull back in to the hips, and gathered cuffs sit at the wrist with the sleeve bloused over them; both hold to the body in the cloth sim.
+- **Latency / pose prediction:** perception sends each frame's joints *with velocities* at the frame's capture time (`filters.PosePredictor`: One-Euro at rest, a constant-velocity Kalman filter once a joint moves). Every render frame, `FTrackingClient::Predict` extrapolates them to the moment that frame reaches the screen, so the garment sits on where the body is now, not where it was ~80 ms ago, and moves at the render rate rather than in 30 Hz steps. In *CameraFeed* mode the overlay is instead matched to the capture time of the image shown under it. Clocks are synced from each frame's send time. Measured end to end with a known trajectory and 60 ms latency: fast-motion error halves (110 → 55 mm), slow motion −20 %, rest jitter < 1 mm/frame. The rest of the pipeline was cut too: JSON goes out before the camera image, the fist classifier runs on its own thread, and pose and depth get separate OpenVINO thread budgets. Together these took capture→renderer from 141 ms to 19 ms on a 4-core test box (measured with the Unity renderer). Tuning lives in `predict`, `filters` and `camera.latency_s` in `calib/config.json`. Debug line (D) shows latency and prediction horizon.
+- **Occlusion (`BodyProxy.cpp`, `M_Proxy`):** stand-ins for the body hide whatever of the garment is behind it. Parts under the garment (torso, neck, sleeved arm) are fitted capsules. Exposed parts (bare forearms, hands with fingers, head with hair) are drawn oversized, then trimmed per pixel to the person mask that BlazePose's landmark model produces (sent with each frame, `net.mask_width`): each fragment is projected into the camera image and dropped where the mask says there is no person, so the cut-out follows the real silhouette. The lookup uses where that body part was when the mask was captured, so prediction doesn't tear it, and it works in both modes. Oversized parts are pushed back by their oversize so they can't poke through sleeves or the collar, and are kept off the garment's outline on screen, where the mask can't tell a hand from the torso behind it (a fitted core hides the cloth there). The occluders are one procedural mesh rebuilt each frame; each part's trim flag, depth push and motion since the mask go in its vertices' UV1–UV3. They draw as the camera-feed pixel they cover (CameraFeed mode) or black (Mirror), so they read as the real body, and they cast shadows, so hands, arms and the head shade the garment. B shows them (trimmed parts tinted warm). With the Unity renderer, on the test clip, they covered 99 % of the real hands, forearms and head (capsules alone: 87 %), and occluder pixels off the body dropped from 35 % to 7 %.
+- **Wire format:** TCP, with Python as the server. Each message is 1 type byte, a 4-byte big-endian length, then the payload: `J` = JSON tracking frame; `R` = float64 capture time + uint16 width + uint16 height + RGB24 camera image (rows bottom first); `M` = float64 capture time + uint16 width + uint16 height + the person mask (uint8, 255 = person). The renderer also accepts the older `I` (float64 capture time + JPEG), decoded on its network thread. The image goes raw because on one machine that's far cheaper than a JPEG encode plus a decode.
+- **Coordinates:** all body, cloth and garment code works in "body coordinates": metres, x to the right as seen facing the screen, y up, z into the screen (perception's Mirror frame with z flipped; `BodyMath.h`). The `MirrorWorld` component maps them to Unreal space (cm, X forward, Y right, Z up) with a proper rotation and ×100, so geometry keeps its winding; in Mirror mode it also mirrors body z, which is the reflection.
+- **Renderer (`ReflectARMirror.cpp`, `MirrorLocalPlayer.cpp`):** two modes. *CameraFeed* places the view at the webcam pose with its intrinsics over the live camera feed, mirrored by flipping the view's x axis (Unreal sees a reflected view and reverses culling itself). *Mirror* renders the reflected `MirrorWorld` with a Kooima off-axis frustum from the tracked eye; this is the mode the two-way-mirror build will use. `UMirrorLocalPlayer::GetProjectionData` hands both to Unreal as a view matrix and a reversed-Z, infinite-far projection.
+- **Look:** physical units: a 3000 lux key light with soft shadows (6° light source angle) and contact shadows, a 700 lux fill, and the room's bounce light as an emissive term (`Ambient`), since there is no environment to light the cloth indirectly. The camera exposure is fixed (ISO 100, 1/60 s, f/4, EV100 ~10), with no tone curve, bloom, vignette, motion blur or film grain, so the camera feed passes through unchanged (the feed and occluder materials divide the exposure back out) and black stays black on the mirror. FXAA instead of TSR, because the cloth has no motion vectors and TSR would smear it. Lumen and reflections are off (`Config/DefaultEngine.ini`).
+- **Garments (upper body only):** 10 tops in `GarmentSpec.cpp`: tee, V-neck, Breton long-sleeve, polo, flannel, hoodie, bomber, denim jacket, puffer, tank.
+  - *Body shape* (`BodyRig.cpp`, `FBodyShape`): the torso is measured from the person mask at six heights between the hips and the shoulders. It walks the mask outward from the torso's centre line to the silhouette edge, then averages the ratio to the generic body over ~1.5 s into `FBodyRig::Profile`. A side is skipped while its arm touches the torso (that edge would be the arm), so it measures whenever an arm is away from the body, for example while swiping. Nothing is measured unless the user faces the camera (±25°). Wider also means deeper (60 % of the width change), for chest and belly. Garments rebuild in the background when a level changes by more than 8 % for 1.5 s.
+  - *Mesh* (`GarmentMesher.cpp`): each garment is generated per user as one seamless surface. A signed-distance field smoothly blends the torso, shoulders, sleeves and collar, so armpits and shoulders have no gaps. It is meshed with surface nets and cut open at the neck, hem and cuffs. The torso cross-section follows the measured body plus ease. Below the chest it hangs from whatever is widest above it (chest or belly) by `Fit` (tank 0.15, tee 0.75, hoodie 0.95), the way fabric falls instead of tucking into the waist. Ribbed hem bands (hoodie, bomber, puffer) pull back in to the hips, and gathered cuffs sit at the wrist with the sleeve bloused over them; both hold to the body in the cloth sim. Built on the thread pool.
   - *UV layout*: the surface is laid out like sewn pattern pieces: front and back panels unrolled around the torso (side seams), a yoke over the shoulder tops, and each sleeve unrolled around the arm (seam underneath). Texture stretch on the tee, flannel and hoodie: median 1.0, 90th percentile ≤ 1.45, area scale within ±8 % for 90 % of the surface. Vertices are split along the seams only for drawing; the solver keeps the welded mesh, and normals come from it, so seams don't show in the shading.
-  - *Closures* (`GarmentTrims.cs`): real geometry that rides on the cloth. A raised placket with sewn buttons (polo 2, flannel 8, denim with metal shanks), or a zipper with tape, teeth, slider and pull (bomber, puffer). It hangs off a chain of points found by ray down the centre front of the rest mesh; each point follows its triangle on the simulated cloth and carries a local frame, so the closure bends with the fabric.
-  - *Physics* (`ClothGarment.cs`): an XPBD cloth solver, with near-inextensible stretch, soft compression so the fabric buckles into wrinkles, and bending, gravity, inertia and damping. It collides with capsules fitted to the body. The cloth is tethered to a version of the mesh skinned to six tracked bones; the tether is ~0 at the collar and shoulders and grows toward the hem and cuffs. Fabric parameters (denim stiff, jersey soft, puffer thick) are per garment.
-  - *Shading*: HDRP as above. URP (`ReflectAR_Garment.shader`): seamless triplanar fabric anchored to the rest pose, so patterns stick to the cloth, with sheen and weave shading. The solver costs ~6 ms per frame in the Editor (Release code optimization).
+  - *Closures* (`GarmentTrims.cpp`): real geometry that rides on the cloth. A raised placket with sewn buttons (polo 2, flannel 8, denim with metal shanks), or a zipper with tape, teeth, slider and pull (bomber, puffer). It hangs off a chain of points found by ray down the centre front of the rest mesh; each point follows its triangle on the simulated cloth and carries a local frame, so the closure bends with the fabric.
+  - *Physics* (`ClothGarment.cpp`): an XPBD cloth solver, with near-inextensible stretch, soft compression so the fabric buckles into wrinkles, and bending, gravity, inertia and damping. It collides with capsules fitted to the body. The cloth is tethered to a version of the mesh skinned to six tracked bones; the tether is ~0 at the collar and shoulders and grows toward the hem and cuffs. Fabric parameters (denim stiff, jersey soft, puffer thick) are per garment.
+  - *Shading* (`M_Fabric`): Unreal's cloth shading model, with per-fabric base colour, a weave normal map and a mask (AO in the weave's valleys, smoothness per fibre: fleece 0.1, denim 0.2, nylon 0.5–0.6), all generated at startup (`FFabricMaps`, 512² with mips), and sheen (fuzz) per garment. Two-sided, lit by the outward normal on both sides, so shading doesn't depend on triangle winding. While a garment fades in or out it switches to a translucent copy of its material (`M_FabricFade`).
 
 ---
 
 ## Performance and battery
 
-Measured on an M5 Pro while tracking one person (CPU, 100 % = one core). The "before" figures are from the OpenVINO-only build:
+Measured on an M5 Pro while tracking one person (CPU, 100 % = one core), with the Unity renderer; the Unreal renderer hasn't been measured yet. The "before" figures are from the OpenVINO-only build:
 
 | | Before | After |
 |---|---|---|
@@ -287,7 +290,7 @@ What made the difference:
 - **Garment meshes:** built on a worker thread and pre-built for all 10 garments once someone is tracked. A rebuild needs a sustained change in the user's measurements (3 s cooldown while the profile settles, then 10 s), because each rebuild resets the cloth.
 - **Cloth:** mesh detail scales with body size and is capped at 4,000 vertices. The cloth inherits 90 % of the body's motion each frame, so 2 substeps are enough and it doesn't trail behind the user.
 - **Frame rate:** capped at 60 fps while tracking and 30 fps when idle, with vsync off (a 120 Hz panel would otherwise render 120 fps).
-- **Diagnostics:** Unity logs `[ReflectAR stats]` every 3 s with fps, worst frame, cloth cost and rebuild count.
+- **Diagnostics:** the renderer logs `[ReflectAR stats]` every 3 s (Output Log) with fps, worst frame, cloth cost and rebuild count.
 
 ## Troubleshooting
 
@@ -298,7 +301,8 @@ What made the difference:
 | `.venv/bin/python: No such file or directory` | The virtual environment must be at `perception/.venv`; redo step 3 |
 | Models run on the CPU although you have a GPU | Check the `[backend]` startup line. NVIDIA: update the driver to 580+. Windows without NVIDIA: install `onnxruntime-directml` (step 3). Run with `--ep-log` for details |
 | `[backend] … TensorrtExecutionProvider failed … trying without it` | TensorRT isn't fully installed. This is harmless: it falls back to CUDA |
-| Unity stays on "Starting… Waiting for the perception service" | Check that perception printed `[net] listening on 127.0.0.1:5566` and nothing else uses port 5566. Host and port are set in `net` in `config.json` and on the `TrackingClient` component |
+| The app stays on "Starting… Waiting for the perception service" | Check that perception printed `[net] listening on 127.0.0.1:5566` and nothing else uses port 5566. Host and port are set in `net` in `config.json` and in `FTrackingClient`'s constructor |
+| Garments or occluders render with the grey default material | The materials are missing: check the Output Log for `ReflectAR setup` lines, or run `reflectar_setup.build()` (setup step 4) |
 | Distance prompts are wrong | Redo the distance calibration on this machine |
 | Garments are offset from your body | Set `screen` and `camera_pose` for your display, and run the intrinsics calibration |
 | First start is slow | Models are compiled on first run and cached in `perception/models/cache/`. TensorRT can take minutes; later starts are faster |
