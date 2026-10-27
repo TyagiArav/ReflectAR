@@ -1,5 +1,17 @@
 {
   "camera": {
+    "_source_note": "auto = an Intel RealSense when one is connected, else the webcam below. realsense | webcam to force one.",
+    "source": "auto",
+    "realsense": {
+      "_note": "Colour + depth aligned to it; the mode follows the USB link. D415 limits: colour 60 fps up to 960x540 (30 at 1280x720), depth 90 fps up to 848x480 (30 at 1280x720), and a USB 2 link only manages 640x480 at 15. A mode the camera doesn't offer falls back to the fastest one no larger. preset: a D400 visual preset name (Default, Hand, High Accuracy, High Density, Medium Density) or null to leave it. latency_s: extra delay on top of the frame's own exposure timestamp.",
+      "usb3": {"color": [960, 540], "color_fps": 60, "depth": [848, 480], "depth_fps": 90},
+      "usb2": {"color": [640, 480], "color_fps": 15, "depth": [640, 480], "depth_fps": 15},
+      "preset": null,
+      "_reset_note": "Power-cycle the camera on start (~4 s): a D415 stopped or killed earlier often streams no frames until reset or replugged. A start that is refused or sends no frames is retried (with a reset) up to start_tries times.",
+      "reset_on_start": true,
+      "start_tries": 4,
+      "latency_s": 0.0
+    },
     "index": 0,
     "api": "auto",
     "width": 1280,
@@ -17,7 +29,7 @@
     "res_y": 1964
   },
   "camera_pose": {
-    "_note": "Camera optical centre in Mirror frame (metres) and downward pitch. Laptop camera sits ~8 mm above the active area, centred.",
+    "_note": "Camera optical centre in Mirror frame (metres) and downward pitch. Laptop camera sits ~8 mm above the active area, centred. With a RealSense, measure to its colour (RGB) lens, not the middle of the bar.",
     "pos_m": [
       0.151,
       0.204,
@@ -30,9 +42,11 @@
     3.0
   ],
   "depth": {
-    "_note": "Weight of the Depth Anything metric estimate vs the BlazePose skeleton-scale estimate when fusing user distance.",
+    "_note": "Weight of the Depth Anything metric estimate vs the BlazePose skeleton-scale estimate when fusing user distance (webcam only). *_surface_offset_m: depth from the measured body surface back to the joint centre.",
     "fusion_weight": 0.7,
-    "torso_surface_offset_m": 0.1
+    "torso_surface_offset_m": 0.1,
+    "limb_surface_offset_m": 0.04,
+    "face_surface_offset_m": 0.01
   },
   "compute": {
     "_note": "backend: auto (ONNX Runtime if installed, else OpenVINO) | onnx | openvino. *_device: auto | ane (Apple Neural Engine) | gpu (Apple GPU, NVIDIA TensorRT/CUDA, DirectML) | cpu. auto = ane on Macs, gpu with NVIDIA, else cpu. *_threads: CPU inference thread budgets (only used when a model runs on the CPU), 0 = auto (depth half the cores). Kept small: big pools burn battery for ~1 ms. Depth is capped because the distance it feeds is smoothed at < 1 Hz; depth_idle_hz applies when nobody is tracked.",
