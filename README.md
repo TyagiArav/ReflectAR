@@ -1,13 +1,13 @@
 # ReflectAR
 
-A virtual try-on mirror. ReflectAR tracks your body through a single webcam and draws simulated garments onto your reflection, rendered from your own eye position so they line up the way a real mirror image would.
+A virtual try-on mirror. ReflectAR tracks your body through an Intel RealSense depth camera (D415) or a plain webcam and draws simulated garments onto your reflection, rendered from your own eye position so they line up the way a real mirror image would.
 
 v1 is a computer prototype: it runs on the computer's own camera and screen. It runs on Macs (Apple Silicon recommended) and Windows PCs (NVIDIA GPU recommended), and on Linux. The same pipeline is meant to drive a 43" two-way-mirror build later.
 
 The system has two programs that talk over a local TCP socket:
 
 ```
- webcam ──► perception/ (Python)  ──TCP 127.0.0.1:5566──►  renderer/ (Unity)  ──► screen
+ camera ──► perception/ (Python)  ──TCP 127.0.0.1:5566──►  renderer/ (Unity)  ──► screen
             pose, hands, depth,                             off-axis camera, cloth
             gestures, filtering                             garments, occlusion, UI
                                                             (HDRP or URP)
@@ -28,7 +28,8 @@ The system has two programs that talk over a local TCP socket:
 | **NumPy** | All geometry, filtering and tensor pre/post-processing |
 | **MediaPipe BlazePose (full)** | Body detection, 33-joint landmarks and the person segmentation mask. MediaPipe's ROI tracking is re-implemented in `blazepose.py`, so the MediaPipe package itself is **not** needed |
 | **MediaPipe Hand Landmarker** | Fist detection on a crop around the raised wrist |
-| **Depth Anything V2 Metric-Indoor-Small** | Metric depth from a single camera |
+| **Intel RealSense SDK** (`pyrealsense2`; `pyrealsense2-macosx` on macOS) | Colour + measured depth from a D415, aligned to the colour image (`realsense.py`) |
+| **Depth Anything V2 Metric-Indoor-Small** | Metric depth from a single camera, when there's no RealSense |
 | **One-Euro filter + constant-velocity Kalman filter** | Smoothing joints and predicting pose ahead in time (`filters.py`) |
 | **TensorFlow + tf2onnx, ONNX** | Only used by `tools/` to convert the original models to `.onnx`. Not needed to run ReflectAR |
 
@@ -60,7 +61,8 @@ ReflectAR/
 ├── run_mirror.sh                # macOS: perception + the standalone app (lowest CPU / battery)
 ├── perception/
 │   ├── requirements.txt         # Python dependencies, with the right runtime per platform
-│   ├── server.py                # main service: webcam → tracking → TCP stream
+│   ├── server.py                # main service: camera → tracking → TCP stream
+│   ├── realsense.py             # Intel RealSense capture + aligned depth
 │   ├── backend.py               # ONNX Runtime / OpenVINO model loading and device choice
 │   ├── fake_server.py           # synthetic skeleton stream, for testing without a camera
 │   ├── calibrate_intrinsics.py  # checkerboard camera calibration
@@ -89,7 +91,7 @@ ReflectAR/
 - **Git**
 - **Python 3.11 or newer**, 64-bit (tested with 3.11 and 3.13)
 - **Unity Hub** and **Unity 6000.6.6f1**. Install it from Unity Hub → *Installs* → *Install Editor* (use the *Archive* tab if that exact version isn't listed). A newer 6000.x editor will usually upgrade the project fine.
-- A webcam, optional: you can test everything without one (see [Running without a camera](#running-without-a-camera)).
+- A camera, optional: an **Intel RealSense D415** (preferred: it measures depth) on a **USB 3** port and cable, or any webcam. You can test everything without one (see [Running without a camera](#running-without-a-camera)).
 - For accelerated inference, one of:
   - a Mac with **macOS 14+** (Apple Silicon) for Core ML,
   - an **NVIDIA GPU with driver 580+**, on Windows or Linux. CUDA and cuDNN are installed as pip packages, so there's no separate CUDA install,
@@ -156,6 +158,8 @@ It prints which device each model ended up on, for example `pose_landmark_full=C
 4. The first time the project opens with HDRP installed, `Editor/PipelineSetup.cs` creates `Assets/Settings/HDRP/ReflectAR_HDRP.asset`, makes HDRP the active pipeline and writes the garment material templates to `Resources/HDRP/`. **ReflectAR > Render Pipeline > URP / HDRP** switches between the two (the URP assets are kept). If HDRP complains about missing settings, run **Window > Rendering > HDRP Wizard > Fix All** once.
 
 ### 5. Camera permissions
+
+- **Intel RealSense on macOS:** macOS only lets root open a RealSense, so with one plugged in `run_perception.sh` and `run_mirror.sh` start perception with `sudo` and ask for your password. Nothing else needs setting up. Use a USB 3 cable plugged straight into the Mac: on a USB 2 link (the startup line says `USB 2.1`) the D415 only runs 640×480 at 15 fps instead of 1280×720 at 30. Quick test: `sudo .venv/bin/python tools/realsense_check.py` from `perception/`.
 
 - **macOS:** grant camera access to the app you start perception from, such as Terminal, iTerm or VS Code: *System Settings → Privacy & Security → Camera*. Turn **Center Stage off** (*Control Centre → Video Effects*). It crops the image and changes the focal length, which breaks the geometry.
 - **Windows:** *Settings → Privacy & security → Camera*, and allow desktop apps to use the camera. Close other apps that are using it.
@@ -235,14 +239,15 @@ There are 10 upper-body garments (`GarmentCatalog.cs`): tee, V-neck, Breton long
 All tuning lives in `perception/calib/config.json`. Each section has a `_note` explaining its fields.
 
 - **Inference device (`compute`):** `backend` = `auto` | `onnx` | `openvino`, and `pose_device` / `depth_device` = `auto` | `ane` | `gpu` | `cpu`. `auto` means the Neural Engine on Macs, the GPU where an NVIDIA or DirectML GPU is available, and otherwise the CPU. `pose_threads` / `depth_threads` set CPU thread budgets (0 = automatic).
-- **Distance (required on a new machine or camera):** stand exactly at a measured distance and run `./run_perception.sh --calib-dist <metres>`. Do this at two distances, such as 1.0 m and 2.0 m. Each run adds a point to `perception/calib/depth_calib.json`, and two points fit a scale and offset for each depth cue. Without it, the 1–3 m prompts can be off by up to 40 %. The committed file was calibrated on the original MacBook.
+- **RealSense (`camera.source`, `camera.realsense`):** `source` is `auto` (the RealSense when one is connected and can be opened, else the webcam), `realsense` or `webcam`. With a RealSense, intrinsics come from its factory calibration and distance is measured, so the intrinsics and distance calibrations below are webcam-only. Set `camera_pose` to the position of its **colour** lens. The `usb3` / `usb2` entries pick the stream mode per USB link.
+- **Distance (webcam only; required on a new machine or camera):** stand exactly at a measured distance and run `./run_perception.sh --calib-dist <metres>`. Do this at two distances, such as 1.0 m and 2.0 m. Each run adds a point to `perception/calib/depth_calib.json`, and two points fit a scale and offset for each depth cue. Without it, the 1–3 m prompts can be off by up to 40 %. The committed file was calibrated on the original MacBook.
 - **Camera intrinsics (recommended):** print a 9×6 inner-corner checkerboard, measure one square, then run `.venv/bin/python calibrate_intrinsics.py --square <metres>` from `perception/`. Show the board at 15–25 angles and distances, pressing SPACE for each one, then press Q to solve. This writes `calib/intrinsics.json`. Until you do, the field of view comes from `camera.hfov_deg`.
 - **Screen and camera position:** `screen` (physical size in metres and resolution) and `camera_pose` (the camera's position relative to the screen's lower-left corner) default to a 14" MacBook Pro. Measure and change them for any other display, including the 43" mirror build.
 - **Camera:** `camera.index` picks the camera if the wrong one opens, and `camera.api` the capture API (see [Camera permissions](#5-camera-permissions)).
 - **Occlusion mask:** `net.mask_width` is the resolution of the person mask sent to Unity (0 turns it off).
 - **Prediction lead (optional, Mirror mode):** wave a hand and press [ / ] until the garment stops trailing or leading the reflection. Then add the shown lead to `camera.latency_s` (or `predict.display_latency_s`).
 
-Absolute distance from one camera is approximate (±10–20 %). Fusion helps, but a real stereo or ToF camera is the target for the mirror build.
+With a webcam, absolute distance is approximate (±10–20 %); fusion helps. The RealSense measures it (D415: about ±2 % at 2 m).
 
 ---
 
@@ -250,7 +255,8 @@ Absolute distance from one camera is approximate (±10–20 %). Fusion helps, bu
 
 - **Inference backends (`backend.py`):** each model loads through ONNX Runtime on the best device it finds, or through OpenVINO on the CPU. On a Mac, the Neural Engine is a good fit because Unity doesn't use it, so inference neither loads the CPU nor competes with rendering. Given the same input, both backends agree to 0.01 px in float32. The Neural Engine only runs float16, so on `ane` the pose and hand models load from their `_fp16.onnx` copies; Core ML would otherwise run a float32 model on its CPU path. Those copies move pose landmarks by ~0.7–1 px on 1280×720 frames (visible joints) and hand landmarks by ~0.1 px. Set `pose_device` to `gpu` for float32 on the Apple GPU instead. The `.onnx` files were converted from the originals with `tools/convert_models.py` (the MediaPipe `.tflite` models) and `tools/ir_to_onnx.py` (the depth IR); you only need to re-run them if a model changes.
 - **Pose:** the stock MediaPipe BlazePose *full* detector and landmark models, with MediaPipe's ROI tracking re-implemented (`blazepose.py`). Each joint's 3D position comes from back-projecting its 2D pixel at a fused distance, plus BlazePose's relative per-joint depth, so the skeleton always lands exactly on the person in the image (`geometry.py`, `server.py`).
-- **Depth from one camera:** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 2 Hz (`compute.depth_max_hz`; 0.5 Hz when nobody is in view) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
+- **Depth from a RealSense (`realsense.py`):** colour and depth stream together and depth is aligned to the colour pixels on the capture thread. The torso depth sets the distance directly, and each visible joint takes the depth measured at its pixel (the nearest surface within 0.35 m of where BlazePose puts it, so limb edges don't read the wall), pushed back by a surface-to-joint offset (`depth.*_surface_offset_m`). Hidden joints keep BlazePose's relative depth. Frames carry their exposure time on the host clock. On start the camera is reset and the start retried until frames arrive, because on macOS a stopped or refused D415 often streams nothing until it's power-cycled.
+- **Depth from one camera (webcam):** Depth Anything V2 *Metric-Indoor-Small*, converted to OpenVINO IR, runs on its own thread, capped at 2 Hz (`compute.depth_max_hz`; 0.5 Hz when nobody is in view) with its own CPU-thread budget so it doesn't slow pose inference. Its torso depth is fused with a skeleton-size cue (70 % mono depth). When the two disagree, mono depth wins, because the skeleton cue is the one that glitches when limbs leave the frame.
 - **Gestures:** `gestures.py`. A swipe is one fast, mostly sideways stroke of the hand (wrist, index and pinky combined, so one blurred landmark doesn't break it), measured on the raw 2D image relative to the shoulders, so it's independent of distance and has no filter lag. It fires mid-stroke once the hand has covered 0.8 shoulder widths with a peak speed of 1.8 shoulder widths/s. Moving the hand back is not a swipe: a stroke the other way only counts once the hand has been still for 0.6 s, and within 3 s of a swipe only if it's at least 80 % as fast. `swipe_direction` is `natural` (scrolling: move the hand right to bring in the item on the left) or `pointer`. With `--log`, rejected strokes print a `[swipe?] … reject` line with the reason. On a synthetic benchmark of realistic swipes, returns, double swipes and non-swipe hand motion, 96 % of swipe cases and 98 % of non-swipe cases come out right (previous detector: 86 % / 94 %; its main failure was the way back firing as an opposite swipe). Fist = MediaPipe hand-landmark model on a crop around the raised wrist (`handpose.py`), with finger-curl ratios. A fist held still blocks swipes.
 - **Latency / pose prediction:** perception sends each frame's joints *with velocities* at the frame's capture time (`filters.PosePredictor`: One-Euro at rest, a constant-velocity Kalman filter once a joint moves). Every render frame, `TrackingClient.Predict` extrapolates them to the moment that frame reaches the screen, so the garment sits on where the body is now, not where it was ~80 ms ago, and moves at the render rate rather than in 30 Hz steps. In *CameraFeed* mode the overlay is instead matched to the capture time of the image shown under it. Clocks are synced from each frame's send time. Measured end to end with a known trajectory and 60 ms latency: fast-motion error halves (110 → 55 mm), slow motion −20 %, rest jitter < 1 mm/frame. The rest of the pipeline was cut too: JSON goes out before the camera image, the fist classifier runs on its own thread, and pose and depth get separate OpenVINO thread budgets. Together these took capture→Unity from 141 ms to 19 ms on a 4-core test box. Tuning lives in `predict`, `filters` and `camera.latency_s` in `calib/config.json`. Debug line (D) shows latency and prediction horizon.
 - **Occlusion (`BodyProxy.cs`, `ReflectAR_DepthOnly.shader`):** depth-only stand-ins for the body hide whatever of the garment is behind it. Parts under the garment (torso, neck, sleeved arm) are fitted capsules. Exposed parts (bare forearms, hands with fingers, head with hair) are drawn oversized, then trimmed per pixel to the person mask that BlazePose's landmark model produces (sent with each frame, `net.mask_width`): each fragment is projected into the camera image and dropped where the mask says there is no person, so the cut-out follows the real silhouette. The lookup uses where that body part was when the mask was captured, so prediction doesn't tear it, and it works in both modes. Oversized parts are pushed back by their oversize so they can't poke through sleeves or the collar. On the test clip it covers 99 % of the real hands, forearms and head (capsules alone: 87 %), and occluder pixels off the body drop from 35 % to 7 %. B shows the proxies (trimmed parts tinted warm).
@@ -299,6 +305,9 @@ What made the difference:
 | Models run on the CPU although you have a GPU | Check the `[backend]` startup line. NVIDIA: update the driver to 580+. Windows without NVIDIA: install `onnxruntime-directml` (step 3). Run with `--ep-log` for details |
 | `[backend] … TensorrtExecutionProvider failed … trying without it` | TensorRT isn't fully installed. This is harmless: it falls back to CUDA |
 | Unity stays on "Starting… Waiting for the perception service" | Check that perception printed `[net] listening on 127.0.0.1:5566` and nothing else uses port 5566. Host and port are set in `net` in `config.json` and on the `TrackingClient` component |
-| Distance prompts are wrong | Redo the distance calibration on this machine |
+| Distance prompts are wrong | Webcam: redo the distance calibration on this machine |
+| `a RealSense is connected but macOS only lets root open it` | Start perception through `run_perception.sh`, or with `sudo` |
+| `RealSense … started but sent no frames` / `failed to set power state` | Unplug and replug the D415, and quit any app using it as a webcam (FaceTime, Photo Booth, browsers) |
+| `[cam] WARNING: RealSense is on a USB 2 link` | Use a USB 3 cable (many USB-C cables are USB 2 only) in a port on the Mac itself, not a hub |
 | Garments are offset from your body | Set `screen` and `camera_pose` for your display, and run the intrinsics calibration |
 | First start is slow | Models are compiled on first run and cached in `perception/models/cache/`. TensorRT can take minutes; later starts are faster |

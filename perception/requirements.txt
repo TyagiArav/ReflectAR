@@ -9,3 +9,7 @@ onnxruntime>=1.20 ; sys_platform == "darwin"
 # Optional: install TensorRT 10 for the fastest path (first run builds engines, cached after).
 # Windows without NVIDIA: replace this line with  onnxruntime-directml  (any DirectX 12 GPU).
 onnxruntime-gpu[cuda,cudnn]>=1.21 ; sys_platform != "darwin"
+# Intel RealSense (optional at run time: without a camera the webcam path is used).
+# macOS has no official wheel; pyrealsense2-macosx is the community build of the same API.
+pyrealsense2-macosx>=2.54 ; sys_platform == "darwin"
+pyrealsense2>=2.54 ; sys_platform != "darwin"
