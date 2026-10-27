@@ -159,7 +159,7 @@ It prints which device each model ended up on, for example `pose_landmark_full=C
 
 ### 5. Camera permissions
 
-- **Intel RealSense on macOS:** macOS only lets root open a RealSense, so with one plugged in `run_perception.sh` and `run_mirror.sh` start perception with `sudo` and ask for your password. Nothing else needs setting up. Use a USB 3 cable plugged straight into the Mac: on a USB 2 link (the startup line says `USB 2.1`) the D415 only runs 640×480 at 15 fps instead of 1280×720 at 30. Quick test: `sudo .venv/bin/python tools/realsense_check.py` from `perception/`.
+- **Intel RealSense on macOS:** macOS only lets root open a RealSense, so with one plugged in `run_perception.sh` and `run_mirror.sh` start perception with `sudo` and ask for your password. Nothing else needs setting up. Use a USB 3 cable plugged straight into the Mac: on a USB 2 link (the startup line says `USB 2.1`) the D415 only runs 640×480 at 15 fps; on USB 3 it runs colour at 960×540 @ 60 fps and depth at 848×480 @ 90 fps (the D415 can't do those rates at 1280×720, which tops out at 30). Quick test: `sudo .venv/bin/python tools/realsense_check.py` from `perception/`.
 
 - **macOS:** grant camera access to the app you start perception from, such as Terminal, iTerm or VS Code: *System Settings → Privacy & Security → Camera*. Turn **Center Stage off** (*Control Centre → Video Effects*). It crops the image and changes the focal length, which breaks the geometry.
 - **Windows:** *Settings → Privacy & security → Camera*, and allow desktop apps to use the camera. Close other apps that are using it.
@@ -308,6 +308,6 @@ What made the difference:
 | Distance prompts are wrong | Webcam: redo the distance calibration on this machine |
 | `a RealSense is connected but macOS only lets root open it` | Start perception through `run_perception.sh`, or with `sudo` |
 | `RealSense … started but sent no frames` / `failed to set power state` | Unplug and replug the D415, and quit any app using it as a webcam (FaceTime, Photo Booth, browsers) |
-| `[cam] WARNING: RealSense is on a USB 2 link` | Use a USB 3 cable (many USB-C cables are USB 2 only) in a port on the Mac itself, not a hub |
+| `[cam] WARNING: RealSense is on a USB 2 link` | Use a USB 3 cable (many USB-C cables are USB 2 only) in a port on the Mac itself, not a hub. The `[state]` line's `cam=` and `depth=` show the rates actually arriving |
 | Garments are offset from your body | Set `screen` and `camera_pose` for your display, and run the intrinsics calibration |
 | First start is slow | Models are compiled on first run and cached in `perception/models/cache/`. TensorRT can take minutes; later starts are faster |

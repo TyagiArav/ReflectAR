@@ -297,7 +297,7 @@ def main():
         print(f"[cam] RealSense: {cam.desc}")
         if not cam.usb.startswith("3"):
             print("[cam] WARNING: RealSense is on a USB 2 link, so it runs at reduced resolution and frame "
-                  "rate; plug it into a USB 3 port with a USB 3 cable for 1280x720 @ 30 fps")
+                  "rate; plug it into a USB 3 port with a USB 3 cable for 60 fps colour + 90 fps depth")
     else:
         depth = MonoDepth(backend, max_hz=depth_model_hz, idle_hz=comp.get("depth_idle_hz", 0.5))
         warmup(depth.model, (1, 3, IN_H, IN_W))
@@ -448,6 +448,7 @@ def main():
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "
                   f"fists={fists} prog={msg['fist_progress']} pose={pose_ms:.1f}ms hands={hands.ms:.1f}ms "
                   f"proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
+                  f"{f'cam={cam.color_hz:.0f}fps ' if sensor else ''}"
                   f"net={'up' if net.connected else 'down'}")
         if args.snapshot and stamp - t_snap > 1.0:
             t_snap = stamp

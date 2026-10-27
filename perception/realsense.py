@@ -18,10 +18,11 @@ except ImportError:                                  # optional: webcam mode wor
 
 # One mode per link type, started once: after a refused mode the D415 stays half-claimed
 # ("failed to claim usb interface") and the next attempt fails or crashes, so no trial and error.
-# A D415 on USB 3 runs 1280x720 colour + depth at 30 fps; a USB 2 link (often just a USB 2
-# cable) can't carry that, and 640x480 colour + depth only arrives at 15 fps.
-MODES = {"usb3": {"color": [1280, 720], "depth": [1280, 720], "fps": 30},
-         "usb2": {"color": [640, 480], "depth": [640, 480], "fps": 15}}
+# D415 limits: colour reaches 60 fps at 960x540 and below (30 at 1280x720), depth 90 fps at
+# 848x480 and below (30 at 1280x720). On USB 3 we take the fast modes; a USB 2 link (often just
+# a USB 2 cable) only delivers 640x480 colour + depth at 15 fps: faster combos start but send nothing.
+MODES = {"usb3": {"color": [960, 540], "color_fps": 60, "depth": [848, 480], "depth_fps": 90},
+         "usb2": {"color": [640, 480], "color_fps": 15, "depth": [640, 480], "depth_fps": 15}}
 
 
 def available():
@@ -45,6 +46,23 @@ def _can_open():
     # Touching the device without USB access fails with "failed to set power state" and then
     # segfaults librealsense when the half-opened device is released, so don't try.
     return sys.platform != "darwin" or os.geteuid() == 0
+
+
+def _pick(dev, stream, fmt, w, h, fps):
+    """The requested mode if the camera offers it, else the fastest offered one no larger than
+    it, so a config typo can't cause a refused start (which leaves the camera stuck)."""
+    offered = {(p.width(), p.height(), p.fps())
+               for s in dev.query_sensors() for p in s.get_stream_profiles()
+               if p.stream_type() == stream and p.format() == fmt and p.is_video_stream_profile()
+               for p in [p.as_video_stream_profile()]}
+    if (w, h, fps) in offered:
+        return w, h, fps
+    fits = [m for m in offered if m[0] <= w and m[1] <= h and m[2] <= fps]
+    if not fits:
+        raise RuntimeError(f"RealSense offers no {stream} mode up to {w}x{h} @ {fps}")
+    best = max(fits, key=lambda m: (m[2], m[0] * m[1]))
+    print(f"[realsense] {stream} {w}x{h} @ {fps} isn't offered; using {best[0]}x{best[1]} @ {best[2]}")
+    return best
 
 
 def _reset(dev, timeout=15.0):
@@ -78,34 +96,45 @@ class RealSenseCamera:
             raise RuntimeError("no RealSense connected")
         if not _can_open():
             raise RuntimeError("macOS only lets root open a RealSense: start the service with sudo")
-        usb = devs[0].get_info(rs.camera_info.usb_type_descriptor) \
-            if devs[0].supports(rs.camera_info.usb_type_descriptor) else "3"
-        link = "usb3" if usb.startswith("3") else "usb2"
-        m = {**MODES[link], **rc.get(link, {})}
-        (cw, ch), (dw, dh), f = m["color"], m["depth"], m["fps"]
-        # librealsense segfaults while tearing down at interpreter exit (even after a refused
-        # start): stop the streams, then leave without running its destructors
+        # librealsense segfaults while tearing down at interpreter exit, even after a failed
+        # query: from here on, stop the streams and leave without running its destructors (a
+        # segfault there leaves the camera too stuck for the next start's reset)
         self.pipe = None
         atexit.register(self._exit)
-        # On macOS the start is a race with the system camera service over the colour interface:
-        # sometimes the start is refused ("failed to set power state") or it starts and never
-        # sends a frame. A reset and another go usually wins it.
-        tries = rc.get("start_tries", 4)
+        # On macOS the start is a race with the system camera service over the colour interface,
+        # and a camera left by a stopped or crashed run is half-claimed: a query can fail with
+        # "failed to set power state", or the start succeeds and never sends a frame. Everything
+        # touching the device happens after a reset, and any failure costs one attempt.
+        tries, link = rc.get("start_tries", 4), "usb3"
         for attempt in range(1, tries + 1):
-            if rc.get("reset_on_start", True) or attempt > 1:
-                devs = _reset(devs[0])
-            dev = devs[0]
-            sensor = dev.first_depth_sensor()
-            self._set_options(sensor, rc.get("preset"))   # before streaming: USB 2 control transfers stall mid-stream
-            cfg = rs.config()
-            cfg.enable_device(dev.get_info(rs.camera_info.serial_number))
-            cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
-            cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
+            try:
+                if rc.get("reset_on_start", True) or attempt > 1:
+                    devs = _reset(devs[0]) if len(devs) else rs.context().query_devices()
+                dev = devs[0]
+                usb = dev.get_info(rs.camera_info.usb_type_descriptor) \
+                    if dev.supports(rs.camera_info.usb_type_descriptor) else "3"
+                link = "usb3" if usb.startswith("3") else "usb2"
+                m = {**MODES[link], **rc.get(link, {})}
+                if "fps" in m:                           # one rate for both streams
+                    m["color_fps"] = m["depth_fps"] = m["fps"]
+                cw, ch, cf = _pick(dev, rs.stream.color, rs.format.bgr8, *m["color"], m["color_fps"])
+                dw, dh, df = _pick(dev, rs.stream.depth, rs.format.z16, *m["depth"], m["depth_fps"])
+                self._set_options(dev.first_depth_sensor(), rc.get("preset"))  # before streaming: USB 2
+                cfg = rs.config()                                                # control transfers stall mid-stream
+                cfg.enable_device(dev.get_info(rs.camera_info.serial_number))
+                cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, cf)
+                cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, df)
+            except (RuntimeError, IndexError) as e:          # IndexError: not back after a reset yet
+                err = f"can't access the camera ({e or 'not connected'})"
+                print(f"[realsense] attempt {attempt}/{tries}: {err}")
+                time.sleep(2.0)
+                devs = rs.context().query_devices()
+                continue
             self.pipe = rs.pipeline()
             try:
                 prof = self.pipe.start(cfg)
             except RuntimeError as e:
-                err = f"refused colour {cw}x{ch} + depth {dw}x{dh} @ {f} fps ({e})"
+                err = f"refused colour {cw}x{ch} @ {cf} + depth {dw}x{dh} @ {df} fps ({e})"
                 self.pipe = None
             else:
                 try:
@@ -117,7 +146,7 @@ class RealSenseCamera:
                     self.pipe = None
             print(f"[realsense] attempt {attempt}/{tries}: {err}")
         else:
-            raise RuntimeError(f"RealSense on USB {usb} {err}. Replug it (and quit any app using it as a "
+            raise RuntimeError(f"RealSense: {err}. Replug it (and quit any app using it as a "
                                f"webcam), or change camera.realsense.{link} in config.json")
         dev = prof.get_device()                            # the pre-start handle can't be used once streaming
         self.depth_scale = dev.first_depth_sensor().get_depth_scale()
@@ -125,10 +154,11 @@ class RealSenseCamera:
         self.intrinsics = dict(fx=ci.fx, fy=ci.fy, cx=ci.ppx, cy=ci.ppy, w=ci.width, h=ci.height)
         self.usb = usb
         self.desc = (f"{dev.get_info(rs.camera_info.name)} fw {dev.get_info(rs.camera_info.firmware_version)} "
-                     f"USB {self.usb}, colour {ci.width}x{ci.height}, depth {dw}x{dh} @ {f} fps")
+                     f"USB {self.usb}, colour {ci.width}x{ci.height} @ {cf} fps, depth {dw}x{dh} @ {df} fps")
         self.align = rs.align(rs.stream.color)
         self.frame, self.depth, self.stamp, self.seq = None, None, 0.0, 0
         self._depth_next = None
+        self.depth_hz = self.color_hz = 0.0              # frames actually arriving
         self.cond = threading.Condition()
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -151,6 +181,8 @@ class RealSenseCamera:
         os._exit(0)
 
     def _loop(self):
+        last_c = last_d = -1
+        n_d, n_c, t_hz = 0, 0, time.time()
         while True:
             try:
                 fs = self.pipe.wait_for_frames(5000)    # the first frames take ~2 s after start
@@ -158,6 +190,20 @@ class RealSenseCamera:
                 print("[realsense] no frames for 5 s")
                 continue
             t_recv = time.time()
+            # With depth faster than colour the pipeline hands over a set per depth frame, holding
+            # the last colour frame: only a new colour frame is a new frame for tracking, and it
+            # comes paired with the newest depth (at 90 fps at most ~11 ms older)
+            d_raw, c = fs.get_depth_frame(), fs.get_color_frame()
+            if d_raw and d_raw.get_frame_number() != last_d:
+                last_d = d_raw.get_frame_number()
+                n_d += 1
+            if t_recv - t_hz > 1.0:
+                dt = t_recv - t_hz
+                self.depth_hz, self.color_hz, n_d, n_c, t_hz = n_d / dt, n_c / dt, 0, 0, t_recv
+            if not c or not d_raw or c.get_frame_number() == last_c:
+                continue
+            last_c = c.get_frame_number()
+            n_c += 1
             fs = self.align.process(fs)
             c, d = fs.get_color_frame(), fs.get_depth_frame()
             if not c or not d:
@@ -189,13 +235,13 @@ class SensorDepth:
     def __init__(self, cam: RealSenseCamera):
         self.cam = cam
         self.active = True
-        self.hz = 0.0
-        self._last = time.time()
+
+    @property
+    def hz(self):
+        return self.cam.depth_hz
 
     def submit(self, _bgr):                            # depth arrives with the frame
-        t = time.time()
-        self.hz = 0.9 * self.hz + 0.1 / max(t - self._last, 1e-3)
-        self._last = t
+        pass
 
     def window(self, u, v, img_w, img_h, r=6):
         """Valid depths (m) in a (2r+1)^2 window around frame pixel (u, v)."""
