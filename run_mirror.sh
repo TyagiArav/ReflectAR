@@ -1,10 +1,10 @@
 #!/bin/bash
-# Run ReflectAR the efficient way: perception + the standalone app (no Unity Editor).
+# Run ReflectAR the efficient way: perception + the packaged app (no Unreal Editor).
 # Quit the app with Esc; perception is stopped with it.
-# Build the app first from the Editor (File > Build Profiles > macOS) into renderer/Builds/ReflectAR.app.
+# Package the app first from the editor (Platforms > Mac > Package Project) into unreal/Build/.
 cd "$(dirname "$0")"
-APP=renderer/Builds/ReflectAR.app
-[ -d "$APP" ] || { echo "No $APP yet: build it from Unity first."; exit 1; }
+APP=unreal/Build/Mac/ReflectAR.app
+[ -d "$APP" ] || { echo "No $APP yet: package it from the Unreal editor first."; exit 1; }
 if [ "$(id -u)" != 0 ] && ioreg -p IOUSB -w0 | grep -q RealSense; then
     # RealSense: perception runs as root (see run_perception.sh); ask for the password now,
     # because the background job can't, and stop it with sudo since we can't signal it
