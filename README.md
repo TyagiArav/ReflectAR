@@ -38,7 +38,7 @@ All model files are already committed in `perception/models/`, in two forms: `.o
 
 | Technology | What it's used for |
 |---|---|
-| **Unreal Engine 5.6+** | The real-time renderer and app (C++ project, no Blueprints) |
+| **Unreal Engine 5.8** | The real-time renderer and app (C++ project, no Blueprints) |
 | **C++** | Everything in `Source/ReflectAR/` |
 | **Procedural Mesh Component** | The simulated garments, their closures, the body occluders and the camera feed, rebuilt every frame |
 | **Cloth shading model, virtual shadow maps, contact shadows** | Fabric with sheen and weave normal maps, soft shadows from a 3000 lux key light |
@@ -90,11 +90,13 @@ ReflectAR/
 
 ## Setup
 
+**Quick start:** see [SETUP.md](SETUP.md). `./setup.sh` (macOS) or `setup.bat` (Windows) sets up the Python environment, checks Xcode or Visual Studio and Unreal Engine, and builds the project. The steps below are what they do, by hand.
+
 ### 1. Requirements
 
 - **Git**
 - **Python 3.11 or newer**, 64-bit (tested with 3.11 and 3.13)
-- **Unreal Engine 5.6 or newer** (Epic Games Launcher → *Unreal Engine* → *Library*), and a C++ toolchain: **Xcode** on macOS, **Visual Studio 2022** with the *Game development with C++* workload on Windows. The project is C++, so the editor compiles it on first open. A newer 5.x engine should open it after a one-time conversion prompt.
+- **Unreal Engine 5.8** (Epic Games Launcher → *Unreal Engine* → *Library*), and a C++ toolchain: **Xcode** with its Metal Toolchain on macOS (`xcodebuild -downloadComponent MetalToolchain`), **Visual Studio 2022 17.14+ or 2026** with the *Game development with C++* workload on Windows. The project is C++, so the editor compiles it on first open.
 - A camera, optional: an **Intel RealSense D415** (preferred: it measures depth) on a **USB 3** port and cable, or any webcam. You can test everything without one (see [Running without a camera](#running-without-a-camera)).
 - For accelerated inference, one of:
   - a Mac with **macOS 14+** (Apple Silicon) for Core ML,

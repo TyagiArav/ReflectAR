@@ -9,3 +9,6 @@ perception/models/cache/
 
 # Unreal (see also unreal/.gitignore)
 unreal/Build/
+
+# setup scripts
+unreal/build.log
