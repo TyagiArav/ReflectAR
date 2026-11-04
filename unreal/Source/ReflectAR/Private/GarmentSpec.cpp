@@ -131,7 +131,7 @@ namespace ReflectAR
 			else { M = new FTexture2DMipMap(Size, Size, 1); PD->Mips.Add(M); }
 			M->SizeX = M->SizeY = Size;
 			M->BulkData.Lock(LOCK_READ_WRITE);
-			FColor* Dst = static_cast<FColor*>(M->BulkData.Realloc(int64(Size) * Size * sizeof(FColor)));
+			FColor* Dst = reinterpret_cast<FColor*>(M->BulkData.Realloc(int64(Size) * Size * sizeof(FColor)));
 			for (int i = 0; i < Size * Size; i++) Dst[i] = Level[i].ToFColor(bSRGB);     // FColor is BGRA in memory
 			M->BulkData.Unlock();
 			if (Size == 1) break;

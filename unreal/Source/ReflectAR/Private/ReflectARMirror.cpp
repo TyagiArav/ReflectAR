@@ -34,6 +34,7 @@ AReflectARMirror::AReflectARMirror()
 	Cube->SetupAttachment(MirrorWorld);
 	KeyLight = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("KeyLight"));
 	KeyLight->SetupAttachment(RootComponent);
+	KeyLight->ForwardShadingPriority = 1;   // the key, not the fill, is the main light for translucency (set before the proxy exists)
 	FillLight = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("FillLight"));
 	FillLight->SetupAttachment(RootComponent);
 	PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("Look"));
@@ -44,7 +45,7 @@ AReflectARMirror::AReflectARMirror()
 AReflectARMirror* AReflectARMirror::Get(const UWorld* World)
 {
 	if (!World) return nullptr;
-	for (TActorIterator<AReflectARMirror> It(const_cast<UWorld*>(World)); It; ++It) return *It;
+	if (TActorIterator<AReflectARMirror> It(const_cast<UWorld*>(World)); It) return *It;
 	return nullptr;
 }
 
