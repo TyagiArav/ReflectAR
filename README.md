@@ -57,10 +57,17 @@ The renderer was a Unity 6 project (HDRP / URP) until this port; it is in the gi
 
 ```
 ReflectAR/
+├── README.md                    # this file: full reference
+├── SETUP.md                     # step-by-step setup for a new machine (macOS and Windows)
+├── setup.sh                     # macOS one-time setup: Python env, Xcode + Unreal checks, C++ build
+├── setup.bat                    # Windows one-time setup (runs setup_windows.ps1)
+├── setup_windows.ps1
 ├── run_perception.sh            # starts the perception service (macOS / Linux)
 ├── run_perception.bat           # starts the perception service (Windows)
 ├── run_mirror.sh                # macOS: perception + the packaged app (lowest CPU / battery)
-├── perception/
+├── .mcp.json                    # points Claude Code at the Unreal editor's MCP server (127.0.0.1:8000)
+├── .gitattributes               # keeps .bat/.ps1 in CRLF and .sh in LF
+├── perception/                  # Python tracking service: camera → pose/depth → TCP 127.0.0.1:5566
 │   ├── requirements.txt         # Python dependencies, with the right runtime per platform
 │   ├── server.py                # main service: camera → tracking → TCP stream
 │   ├── realsense.py             # Intel RealSense capture + aligned depth
@@ -74,15 +81,17 @@ ReflectAR/
 │   ├── filters.py               # One-Euro / Kalman pose predictor
 │   ├── gestures.py              # swipe + fist-hold detection
 │   ├── calib/                   # config.json (all tuning) + depth_calib.json
-│   ├── models/                  # .onnx, .tflite and OpenVINO IR model files
-│   └── tools/                   # model converters (only needed if a model changes)
-└── unreal/                      # Unreal Engine 5 project
-    ├── ReflectAR.uproject
-    ├── Config/                  # game mode, local player, renderer settings
-    ├── Content/Python/          # reflectar_setup.py: builds the materials (Content/ReflectAR/)
+│   ├── models/                  # .onnx, .tflite and OpenVINO IR model files (~500 MB, committed)
+│   └── tools/                   # model converters (only needed if a model changes), realsense_check.py
+└── unreal/                      # Unreal Engine 5.8 project (the renderer)
+    ├── ReflectAR.uproject       # engine version + plugins
+    ├── Config/                  # game mode, local player, renderer settings (DefaultEngine.ini),
+    │                            # editor defaults (DefaultEditorSettings.ini, ...PerProjectUserSettings.ini)
+    ├── Content/Python/          # init_unreal.py + reflectar_setup.py: build the materials (Content/ReflectAR/)
     └── Source/ReflectAR/
         ├── Public/, Private/    # ReflectARMirror (the app), TrackingClient, BodyRig, BodyProxy,
-        │                        # GarmentMesher, ClothGarment, GarmentTrims, GarmentSpec, HUD
+        │                        # GarmentMesher, ClothGarment, GarmentTrims, GarmentSpec,
+        │                        # ReflectARGameMode (spawns the mirror, draws the HUD), MirrorLocalPlayer
         └── ReflectAR.Build.cs
 ```
 
