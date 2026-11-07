@@ -73,8 +73,14 @@ def texture(mat, name, uv, x, y):
     return t
 
 
-def collection(mat, mpc, name, x, y):
-    return node(mat, unreal.MaterialExpressionCollectionParameter, x, y, collection=mpc, parameter_name=name)
+def collection(mat, mpc, name, x, y, rgb=False):
+    c = node(mat, unreal.MaterialExpressionCollectionParameter, x, y, collection=mpc, parameter_name=name)
+    if not rgb:
+        return c
+    # the collection node only outputs float4, and float3 * float4 doesn't compile
+    k = node(mat, unreal.MaterialExpressionComponentMask, x + 200, y, r=True, g=True, b=True, a=False)
+    link(c, "", k, "")
+    return k
 
 
 def mul(mat, a, b, x, y, a_out="", b_out=""):
@@ -133,28 +139,31 @@ def build_fabric(mpc, fade):
     base = texture(m, "BaseColorMap", uv, -1000, -300)
     nrm = texture(m, "NormalMap", uv, -1000, 0)
     msk = texture(m, "MaskMap", uv, -1000, 300)
+    m.set_editor_property("use_material_attributes", True)
+    attrs = node(m, unreal.MaterialExpressionMakeMaterialAttributes, 0, 0)
+    mel.connect_material_property(attrs, "", P.MP_MATERIAL_ATTRIBUTES)
     col = mul(m, base, vector(m, "Tint", unreal.LinearColor(1, 1, 1, 1), -1000, -500), -700, -300, a_out="RGB")
-    mel.connect_material_property(col, "", P.MP_BASE_COLOR)
+    link(col, "", attrs, "BaseColor")
     n = custom(m, -700, 0, NORMAL_CODE, ["N", "Sign"], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
     link(nrm, "RGB", n, "N")
     link(node(m, unreal.MaterialExpressionTwoSidedSign, -1000, 150), "", n, "Sign")
-    mel.connect_material_property(n, "", P.MP_NORMAL)
+    link(n, "", attrs, "Normal")
     rough = node(m, unreal.MaterialExpressionOneMinus, -700, 300)
     link(msk, "A", rough, "")
-    mel.connect_material_property(rough, "", P.MP_ROUGHNESS)
-    mel.connect_material_property(msk, "G", P.MP_AMBIENT_OCCLUSION)
-    mel.connect_material_property(scalar(m, "Metallic", 0.0, -700, 450), "", P.MP_METALLIC)
+    link(rough, "", attrs, "Roughness")
+    link(msk, "G", attrs, "AmbientOcclusion")
+    link(scalar(m, "Metallic", 0.0, -700, 450), "", attrs, "Metallic")
     # cloth: fuzz colour = a lighter version of the base, amount = Sheen
     sheen = scalar(m, "Sheen", 0.25, -700, 600)
     lighter = node(m, unreal.MaterialExpressionLinearInterpolate, -450, 500, const_b=1.0, const_alpha=0.4)
     link(col, "", lighter, "A")
-    mel.connect_material_property(mul(m, lighter, sheen, -250, 500), "", P.MP_SUBSURFACE_COLOR)
-    mel.connect_material_property(sheen, "", P.MP_CUSTOM_DATA0)
+    link(mul(m, lighter, sheen, -250, 500), "", attrs, "SubsurfaceColor")
+    link(sheen, "", attrs, "ClearCoat")
     # the room's bounce light (there is no environment to light the cloth indirectly)
-    amb = mul(m, mul(m, col, msk, -450, 200, b_out="G"), collection(m, mpc, "Ambient", -700, 750), -250, 200)
-    mel.connect_material_property(amb, "", P.MP_EMISSIVE_COLOR)
+    amb = mul(m, mul(m, col, msk, -450, 200, b_out="G"), collection(m, mpc, "Ambient", -700, 750, rgb=True), -250, 200)
+    link(amb, "", attrs, "EmissiveColor")
     if fade:
-        mel.connect_material_property(scalar(m, "Alpha", 1.0, -250, 750), "", P.MP_OPACITY)
+        link(scalar(m, "Alpha", 1.0, -250, 750), "", attrs, "Opacity")
     finish(m)
 
 
@@ -175,7 +184,7 @@ def build_trim(mpc, fade):
     mel.connect_material_property(n, "", P.MP_NORMAL)
     dielectric = node(m, unreal.MaterialExpressionOneMinus, -600, 0)
     link(metal, "", dielectric, "")
-    amb = mul(m, mul(m, tint, dielectric, -400, -100), collection(m, mpc, "Ambient", -600, 450), -200, -100)
+    amb = mul(m, mul(m, tint, dielectric, -400, -100), collection(m, mpc, "Ambient", -600, 450, rgb=True), -200, -100)
     mel.connect_material_property(amb, "", P.MP_EMISSIVE_COLOR)
     if fade:
         mel.connect_material_property(scalar(m, "Alpha", 1.0, -200, 300), "", P.MP_OPACITY)

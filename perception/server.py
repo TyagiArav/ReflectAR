@@ -1,7 +1,11 @@
 """ReflectAR perception service.
 
-Webcam -> BlazePose (OpenVINO) + metric mono depth -> 3D joints/eye in the
+Camera -> BlazePose (OpenVINO) + metric depth -> 3D joints/eye in the
 Mirror frame -> gestures + range check -> TCP stream to Unity.
+
+Depth comes from an Intel RealSense when one is connected (measured, aligned to the colour
+frame; see realsense.py), otherwise from a webcam + Depth Anything mono depth fused with the
+skeleton-size cue.
 
 Wire format (TCP, Python is the server, Unity connects):
     1 byte type ('J' = JSON tracking frame, 'R' = raw camera image, 'M' = person mask)
@@ -17,6 +21,7 @@ Latency: each 'J' frame carries joint positions *and velocities* at the frame's 
 reaches the screen (see filters.PosePredictor, TrackingClient.Predict).
 
 Run:  .venv/bin/python server.py [--snapshot debug.jpg] [--no-image]
+      (macOS with a RealSense: sudo .venv/bin/python server.py)
 """
 import argparse, json, os, socket, struct, sys, threading, time
 if sys.platform == "win32":                          # MSMF otherwise takes seconds to open a webcam
@@ -31,9 +36,11 @@ from depth import MonoDepth, IN_H, IN_W
 from filters import OneEuro, PosePredictor
 from geometry import Intrinsics, skeleton_distance, CameraToMirror
 from gestures import Gestures, SIDES
+import realsense
 
 L_EYE, R_EYE = 2, 5
 TORSO = (11, 12, 23, 24)
+FACE = range(0, 11)
 
 
 # --------------------------------------------------------------------------- IO
@@ -276,17 +283,33 @@ def main():
     warmup(pose.det, (1, DET_SIZE, DET_SIZE, 3)); warmup(pose.lm, (1, LM_SIZE, LM_SIZE, 3))
     warmup(hand_model.model, (1, HAND_SIZE, HAND_SIZE, 3))
     hands = HandWorker(hand_model)
-    depth = MonoDepth(backend, max_hz=depth_model_hz, idle_hz=comp.get("depth_idle_hz", 0.5))
-    idle_fps = comp.get("idle_pose_fps", 6.0)
-    warmup(depth.model, (1, 3, IN_H, IN_W))
-    print(backend.summary())
-    print(f"[backend] devices {backend.devices}, CPU threads {backend.threads}, depth capped at "
-          f"{depth_model_hz} Hz, warm-up {time.time() - t_w:.1f} s")
     cc = cfg["camera"]
-    cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("api", "auto"))
+    source = "webcam" if args.video else cc.get("source", "auto")
+    if source == "auto":
+        source = "realsense" if realsense.available() else "webcam"
+    sensor = source == "realsense"
+    if sensor:
+        if args.calib_dist:
+            raise SystemExit("--calib-dist is only for the webcam: the RealSense measures distance directly")
+        rc = cc.get("realsense", {})
+        cam = realsense.RealSenseCamera(rc)
+        depth = realsense.SensorDepth(cam)
+        print(f"[cam] RealSense: {cam.desc}")
+        if not cam.usb.startswith("3"):
+            print("[cam] WARNING: RealSense is on a USB 2 link, so it runs at reduced resolution and frame "
+                  "rate; plug it into a USB 3 port with a USB 3 cable for 60 fps colour + 90 fps depth")
+    else:
+        depth = MonoDepth(backend, max_hz=depth_model_hz, idle_hz=comp.get("depth_idle_hz", 0.5))
+        warmup(depth.model, (1, 3, IN_H, IN_W))
+    idle_fps = comp.get("idle_pose_fps", 6.0)
+    print(backend.summary())
+    print(f"[backend] devices {backend.devices}, CPU threads {backend.threads}, depth "
+          f"{'RealSense' if sensor else f'model capped at {depth_model_hz} Hz'}, warm-up {time.time() - t_w:.1f} s")
+    if not sensor:
+        cam = Camera(cc["index"], cc["width"], cc["height"], args.video, cc.get("api", "auto"))
     frame, _, seq = cam.read(0)
     H, W = frame.shape[:2]
-    K = Intrinsics.load(cc, W, H)
+    K = Intrinsics(**cam.intrinsics) if sensor else Intrinsics.load(cc, W, H)
     to_mirror = CameraToMirror(cfg["camera_pose"])
     net = Streamer(cfg["net"]["host"], cfg["net"]["port"], cfg["net"]["jpeg_width"], cfg["net"]["jpeg_quality"])
     gest = Gestures(cfg["gestures"])
@@ -294,11 +317,15 @@ def main():
     fj, fe = cfg["filters"]["joints"], cfg["filters"]["eye"]
     f_joints, f_eye, f_dist = PosePredictor(**fj), PosePredictor(**fe), OneEuro(0.5, 0.3)
     pred_cfg = cfg.get("predict", {})
-    cam_lat = cc.get("latency_s", 0.0)               # exposure -> frame delivered to us
-    wfuse = cfg["depth"]["fusion_weight"]
-    cal = load_depth_calib()
+    # exposure -> frame delivered to us (RealSense frames already carry their exposure time)
+    cam_lat = cc.get("realsense", {}).get("latency_s", 0.0) if sensor else cc.get("latency_s", 0.0)
+    dc = cfg["depth"]
+    wfuse = dc["fusion_weight"]
+    cal = load_depth_calib() if not sensor else {"skel": (1.0, 0.0), "da": (1.0, 0.0), "points": [],
+                                                 "calibrated": True}
     calib = DistanceCalibrator(args.calib_dist, cal) if args.calib_dist else None
-    src = "intrinsics.json" if os.path.exists(cc.get("intrinsics_file", "")) else f"hfov {cc['hfov_deg']} deg guess"
+    src = "factory calibration" if sensor else \
+        "intrinsics.json" if os.path.exists(cc.get("intrinsics_file", "")) else f"hfov {cc['hfov_deg']} deg guess"
     print(f"[cam] {W}x{H}  fx={K.fx:.0f} ({src})  depth calib: skel={cal['skel']} da={cal['da']} "
           f"from {[p['d'] for p in cal['points']]} m")
 
@@ -332,7 +359,7 @@ def main():
                 z_skel = None
             samples = [depth.sample(*uv[i], W, H) for i in TORSO if vis[i] > 0.5]
             samples = [s for s in samples if s]
-            z_da_raw = float(np.median(samples)) + cfg["depth"]["torso_surface_offset_m"] if samples else None
+            z_da_raw = float(np.median(samples)) + dc["torso_surface_offset_m"] if samples else None
             z_da = cal["da"][0] * z_da_raw + cal["da"][1] if z_da_raw else None
             if z_da:
                 last_da = (z_da, stamp)
@@ -344,7 +371,9 @@ def main():
                 else:
                     z_skel = z_da
             z_fused = z_skel
-            if cal["calibrated"] and z_da:
+            if sensor:                                # measured: nothing to fuse with
+                z_fused = z_da or z_skel
+            elif cal["calibrated"] and z_da:
                 # cues agree: blend; disagree: the skeleton cue is the one that glitches
                 # (limbs out of frame, turned torso), so trust mono depth alone
                 agree = 0.75 * z_da < z_skel < 1.33 * z_da
@@ -355,6 +384,15 @@ def main():
             # --- per-joint depth from BlazePose's relative z; x/y back-projected from pixels,
             #     so the 3D skeleton always lands exactly on the person in the image
             Z = np.maximum(z_root + (world[:, 2] - world[list(TORSO), 2].mean()), 0.2)
+            if sensor:
+                # measured depth wherever the joint's pixel lands on the body near where BlazePose
+                # puts it; the relative-z guess fills joints that are hidden or off the depth map
+                for i in range(len(Z)):
+                    if vis[i] > 0.5:
+                        z = depth.joint(*uv[i], W, H, Z[i])
+                        if z is not None:
+                            Z[i] = z + (dc["face_surface_offset_m"] if i in FACE else
+                                        dc["torso_surface_offset_m"] if i in TORSO else dc["limb_surface_offset_m"])
             P_c = np.stack([(uv[:, 0] - K.cx) * Z / K.fx, (uv[:, 1] - K.cy) * Z / K.fy, Z], axis=1)
             P_m, V_m = f_joints(to_mirror(P_c), stamp, vis)
             eye, eye_v = f_eye(to_mirror((P_c[L_EYE] + P_c[R_EYE]) / 2), stamp)
@@ -410,6 +448,7 @@ def main():
                   f"zskel={msg.get('z_skel')} zda={msg.get('z_da')} scale={msg.get('scale')} "
                   f"fists={fists} prog={msg['fist_progress']} pose={pose_ms:.1f}ms hands={hands.ms:.1f}ms "
                   f"proc={fps:.0f}fps depth={depth.hz:.0f}Hz "
+                  f"{f'cam={cam.color_hz:.0f}fps ' if sensor else ''}"
                   f"net={'up' if net.connected else 'down'}")
         if args.snapshot and stamp - t_snap > 1.0:
             t_snap = stamp
