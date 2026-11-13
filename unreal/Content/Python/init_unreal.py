@@ -1,4 +1,5 @@
-"""Runs at every editor start (Python Editor Script Plugin): builds the materials once if missing."""
+"""Runs at every editor start (Python Editor Script Plugin): builds the materials if they are
+missing or were built by an older reflectar_setup.py."""
 import unreal
 
 _handle = None
@@ -7,9 +8,9 @@ _handle = None
 def _build_once(_dt):
     global _handle
     unreal.unregister_slate_post_tick_callback(_handle)
-    if unreal.EditorAssetLibrary.does_asset_exist("/Game/ReflectAR/M_Proxy"):
-        return
     import reflectar_setup
+    if unreal.EditorAssetLibrary.does_asset_exist("/Game/ReflectAR/M_Proxy") and reflectar_setup.is_current():
+        return
     reflectar_setup.build()
 
 

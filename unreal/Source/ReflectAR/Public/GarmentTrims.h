@@ -11,6 +11,7 @@ namespace ReflectAR
 		TArray<V4> Tan;               // xyz tangent, w handedness
 		TArray<V2> UV;
 		TArray<int32> Tris;
+		TArray<FColor> Col;           // optional: R = ambient occlusion, G = distance from the nearest edge (hem, cuff, neck)
 	};
 
 	/**

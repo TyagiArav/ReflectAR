@@ -12,13 +12,106 @@ namespace ReflectAR
 	void FBodyRig::Update(const V3* Target, const float* InVis, float Dt, bool bSnap)
 	{
 		const float a = bSnap || Smoothing <= 0.f ? 1.f : 1.f - FMath::Exp(-Smoothing * Dt);
+		bSnap = bSnap || !bMeasured;
+		for (int i = 0; i < LM::Count; i++) Vis[i] = InVis[i];
+		if (bStabilise) Stabilise(Target, Dt, bSnap);
+		else
+		{
+			for (int i = 0; i < LM::Count; i++) J[i] = LerpV(J[i], Target[i], a);
+			bFrontal = true;
+			for (bool& b : bArmSquare) b = true;
+		}
+		Derive(bSnap);
+		Valid = true;
+	}
+
+	// ------------------------------------------------------------------ depth stabilisation
+	static const int Torso4[4] = { LM::LShoulder, LM::RShoulder, LM::LHip, LM::RHip };
+	// joints that hang off each shoulder / hip and move in depth with it
+	static const int ChainLSh[] = { LM::LElbow, LM::LWrist, LM::LPinky, LM::LIndex, LM::LThumb };
+	static const int ChainRSh[] = { LM::RElbow, LM::RWrist, LM::RPinky, LM::RIndex, LM::RThumb };
+	static const int ChainLHip[] = { LM::LKnee, LM::LAnkle, 29, 31 };
+	static const int ChainRHip[] = { LM::RKnee, LM::RAnkle, 30, 32 };
+
+	/**
+	 * Depth difference between joints a and b (distance from the camera, b minus a), given how
+	 * far apart they really are. Their image positions fix how wide the pair looks; whatever of
+	 * Width is missing must be depth. Near square-on that is ill-conditioned (and Width is only
+	 * known to a few percent), so the tracked difference is used there and blended out as the
+	 * pair turns. Updates Rho[a], Rho[b] about their mean and returns the change applied to b.
+	 */
+	float FBodyRig::SolvePair(int a, int b, int Which, float Width, const V3* Dir, float* Rho)
+	{
+		const float Mid = 0.5f * (Rho[a] + Rho[b]), Cs = FMath::Clamp(Dot(Dir[a], Dir[b]), -1.f, 1.f);
+		const float Seen2 = 2.f * Mid * Mid * (1.f - Cs);                 // squared distance if both were at the same depth
+		const float Fore = FMath::Sqrt(FMath::Max(Width * Width - Seen2, 0.f) * 2.f / (1.f + Cs));
+		const float Tracked = Rho[b] - Rho[a];
+		// which one is nearer: from the tracker, but it may only change its mind while the pair is
+		// close to square-on (a real turn passes through there) or when it is emphatic
+		float& Sign = PairSign[Which];
+		const float Want = Tracked >= 0.f ? 1.f : -1.f;
+		if (Sign == 0.f || (Want != Sign && (Fore < 0.45f * Width || FMath::Abs(Tracked) > 0.25f * Width))) Sign = Want;
+		const float w = SmoothStep(0.f, 1.f, (Fore / FMath::Max(Width, 1e-3f) - 0.28f) / 0.22f);
+		const float Delta = Tracked + (Sign * Fore - Tracked) * w;
+		const float Shift = (Mid + 0.5f * Delta) - Rho[b];
+		Rho[a] = Mid - 0.5f * Delta;
+		Rho[b] = Mid + 0.5f * Delta;
+		return Shift;
+	}
+
+	void FBodyRig::Stabilise(const V3* Target, float Dt, bool bSnap)
+	{
+		V3 Dir[LM::Count];
+		float Rho[LM::Count];
 		for (int i = 0; i < LM::Count; i++)
 		{
-			J[i] = LerpV(J[i], Target[i], a);
-			Vis[i] = InVis[i];
+			const V3 d = Target[i] - CamPos;
+			Rho[i] = FMath::Max(d.Size(), 1e-3f);
+			Dir[i] = d / Rho[i];
 		}
-		Derive(bSnap || !bMeasured);
-		Valid = true;
+		float Root = 0.f;
+		for (int i : Torso4) Root += Rho[i] * 0.25f;
+
+		// ---- One-Euro on each joint's depth relative to the torso
+		const float SafeDt = FMath::Clamp(Dt, 1e-3f, 0.1f);
+		auto Alpha = [SafeDt](float Cutoff) { return 1.f / (1.f + 1.f / (2.f * PI * Cutoff * SafeDt)); };
+		for (int i = 0; i < LM::Count; i++)
+		{
+			const float Rel = Rho[i] - Root;
+			if (bSnap) { RelDepth[i] = RelRaw[i] = Rel; RelVel[i] = 0.f; }
+			else
+			{
+				RelVel[i] += ((Rel - RelRaw[i]) / SafeDt - RelVel[i]) * Alpha(1.f);
+				RelRaw[i] = Rel;
+				RelDepth[i] += (Rel - RelDepth[i]) * Alpha(DepthMinCutoff + DepthBeta * FMath::Abs(RelVel[i]));
+			}
+			Rho[i] = Root + RelDepth[i];
+		}
+
+		// ---- can lengths be measured right now? only what is seen (nearly) side-on
+		auto Square = [&](int a, int b)
+		{
+			const float Mid = 0.5f * (Rho[a] + Rho[b]);
+			const float Seen = Mid * FMath::Sqrt(FMath::Max(2.f * (1.f - Dot(Dir[a], Dir[b])), 0.f));
+			return FMath::Abs(Rho[b] - Rho[a]) < 0.2f * Seen && Vis[a] > 0.5f && Vis[b] > 0.5f;
+		};
+		bFrontal = Square(LM::LShoulder, LM::RShoulder);
+		bArmSquare[0] = Square(LM::LShoulder, LM::LElbow); bArmSquare[1] = Square(LM::RShoulder, LM::RElbow);
+		bArmSquare[2] = Square(LM::LElbow, LM::LWrist); bArmSquare[3] = Square(LM::RElbow, LM::RWrist);
+
+		// ---- shoulders and hips: depth difference from foreshortening
+		if (!bSnap)
+		{
+			const float dSh = SolvePair(LM::LShoulder, LM::RShoulder, 0, ShoulderW, Dir, Rho);
+			for (int i : ChainRSh) Rho[i] += dSh;
+			for (int i : ChainLSh) Rho[i] -= dSh;
+			const float dHip = SolvePair(LM::LHip, LM::RHip, 1, HipW, Dir, Rho);
+			for (int i : ChainRHip) Rho[i] += dHip;
+			for (int i : ChainLHip) Rho[i] -= dHip;
+		}
+		else PairSign[0] = PairSign[1] = 0.f;
+
+		for (int i = 0; i < LM::Count; i++) J[i] = CamPos + Dir[i] * Rho[i];
 	}
 
 	void FBodyRig::Derive(bool bResetMeasures)
@@ -28,23 +121,36 @@ namespace ReflectAR
 		Up = Normalized(ShC - HipC);
 		Right = Normalized(ProjectOnPlane(J[LM::RShoulder] - J[LM::LShoulder], Up));
 		Fwd = Cross(Right, Up);
-		PRight = Normalized(ProjectOnPlane(J[LM::RHip] - J[LM::LHip], Up));
-		if (PRight.SizeSquared() < 0.5f) PRight = Right;
+		// the pelvis turns with the chest, give or take a twist at the waist; its own measurement is
+		// poor (the hip joints are close together and hidden), so it only gets half a say
+		V3 Pr = Normalized(ProjectOnPlane(J[LM::RHip] - J[LM::LHip], Up));
+		if (Pr.SizeSquared() < 0.5f || Dot(Pr, Right) < 0.f) Pr = Right;
+		PRight = SlerpDir(Right, Pr, 0.5f);
 		PFwd = Cross(PRight, Up);
+		const V3 ToCam = Normalized(ProjectOnPlane(CamPos - ShC, Up));
+		YawDeg = FMath::RadiansToDegrees(FMath::Atan2(Dot(Cross(Fwd, ToCam), Up), Dot(Fwd, ToCam)));
 
-		// Body measurements change slowly; smooth hard so garments don't breathe.
-		const float k = bResetMeasures ? 1.f : 0.03f;
-		ShoulderW = Lerp(ShoulderW, FMath::Clamp(Seg(LM::LShoulder, LM::RShoulder), 0.25f, 0.55f), k);
-		HipW = Lerp(HipW, FMath::Clamp(Seg(LM::LHip, LM::RHip), 0.15f, 0.40f), k);
-		TorsoLen = Lerp(TorsoLen, FMath::Clamp(FVector3f::Distance(HipC, ShC), 0.35f, 0.75f), k);
-		const float earW = Seg(LM::LEar, LM::REar);
-		HeadR = Lerp(HeadR, FMath::Clamp(earW * 0.62f, 0.075f, 0.13f), k);
-		ArmLenL = Lerp(ArmLenL, Seg(LM::LShoulder, LM::LElbow) + Seg(LM::LElbow, LM::LWrist), k);
-		ArmLenR = Lerp(ArmLenR, Seg(LM::RShoulder, LM::RElbow) + Seg(LM::RElbow, LM::RWrist), k);
-		UpperL = Lerp(UpperL, FMath::Clamp(Seg(LM::LShoulder, LM::LElbow), 0.18f, 0.40f), k);
-		UpperR = Lerp(UpperR, FMath::Clamp(Seg(LM::RShoulder, LM::RElbow), 0.18f, 0.40f), k);
-		ForeL = Lerp(ForeL, FMath::Clamp(Seg(LM::LElbow, LM::LWrist), 0.16f, 0.36f), k);
-		ForeR = Lerp(ForeR, FMath::Clamp(Seg(LM::RElbow, LM::RWrist), 0.16f, 0.36f), k);
+		// Body measurements change slowly; smooth hard so garments don't breathe. Turned away from
+		// the camera a length can only read short (foreshortened, and the tracker flattens depth),
+		// so a longer reading is believed readily and a shorter one only slowly, while seen side-on.
+		const float TorsoNow = FMath::Clamp(FVector3f::Distance(HipC, ShC), 0.35f, 0.75f);
+		TorsoLen = Lerp(TorsoLen, TorsoNow, bResetMeasures ? 1.f : 0.03f);
+		auto Measure = [bResetMeasures](float& Len, float Now, float Lo, float Hi, float Prior, bool bSquare)
+		{
+			Now = FMath::Clamp(Now, Lo, Hi);
+			if (bResetMeasures) Len = FMath::Max(Now, FMath::Min(Prior, Hi));   // first sight may be foreshortened
+			else if (Now > Len) Len = Lerp(Len, Now, 0.05f);
+			else if (bSquare) Len = Lerp(Len, Now, 0.004f);
+		};
+		Measure(ShoulderW, Seg(LM::LShoulder, LM::RShoulder), 0.25f, 0.55f, 0.62f * TorsoNow, bFrontal);
+		Measure(HipW, Seg(LM::LHip, LM::RHip), 0.15f, 0.40f, 0.36f * TorsoNow, bFrontal);
+		Measure(HeadR, Seg(LM::LEar, LM::REar) * 0.62f, 0.075f, 0.13f, 0.f, bFrontal);
+		Measure(UpperL, Seg(LM::LShoulder, LM::LElbow), 0.18f, 0.40f, 0.5f * TorsoNow, bArmSquare[0]);
+		Measure(UpperR, Seg(LM::RShoulder, LM::RElbow), 0.18f, 0.40f, 0.5f * TorsoNow, bArmSquare[1]);
+		Measure(ForeL, Seg(LM::LElbow, LM::LWrist), 0.16f, 0.36f, 0.45f * TorsoNow, bArmSquare[2]);
+		Measure(ForeR, Seg(LM::RElbow, LM::RWrist), 0.16f, 0.36f, 0.45f * TorsoNow, bArmSquare[3]);
+		ArmLenL = UpperL + ForeL;
+		ArmLenR = UpperR + ForeR;
 		bMeasured = true;
 
 		NeckBase = ShC + (Up * 0.03f - Fwd * 0.01f) * Unit();
@@ -137,11 +243,13 @@ namespace ReflectAR
 				Sum += Edge;
 				N++;
 			}
-			if (N == 0) continue;
+			// at the hips and waist an arm hanging by the side merges with the silhouette more often
+			// than not: only believe a width there when both sides are clear
+			if (N == 0 || (t < 0.3f && N < 2)) continue;
 			float a, d;
 			FRestSkeleton::BodyModel(t, B.HipW, B.ShoulderW, U, a, d);
 			const float r = Sum / N / a;
-			if (r < 0.7f || r > 1.6f) continue;
+			if (r < 0.8f || r > 1.3f) continue;                                             // not a body: clothes, a bag, a bad mask
 			if (LevelSamples[k] > 15 && FMath::Abs(r - B.Profile[k]) > 0.2f) continue;   // a bag, a loose sleeve, ...
 			B.Profile[k] = LevelSamples[k] == 0 ? r : Lerp(B.Profile[k], r, Rate);
 			LevelSamples[k]++;

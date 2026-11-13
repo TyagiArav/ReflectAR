@@ -1,0 +1,4 @@
+harness
+out/
+*.ppm
+*.png

@@ -43,6 +43,18 @@ namespace ReflectAR
 		/** True once after a new mesh was swapped in: its sections must be re-created. */
 		bool ConsumeTopologyChanged() { const bool b = bTopologyChanged; bTopologyChanged = false; return b; }
 
+		/**
+		 * The body under the garment at height t (fraction of the torso: 0 = hip joints, 1 = shoulder
+		 * joints): centre, right / forward axes and the half-width a / half-depth d of its elliptical
+		 * cross-section. The cloth collides with exactly this, and the torso occluder is drawn just
+		 * inside it, so the occluder can never show through the garment. False until a mesh exists.
+		 */
+		bool TorsoSection(float t, V3& C, V3& R, V3& F, float& a, float& d) const;
+		/** Lowest height (same units as t) the torso under this garment needs to cover. */
+		float BodyBottom() const { return Spec.Hem - 0.14f; }
+		// arm radii the cloth collides with (m, for a 0.36 m shoulder span); occluders stay inside them
+		static constexpr float UpperArmR = 0.046f, ForearmR = 0.040f, ShoulderR = 0.042f;
+
 		/** How far the cloth may stand off the body (ease plus drape), with a little to spare. */
 		float Room() const { return ((0.03f + Spec.Ease) * Spec.Drape + 0.01f) * Body.Unit(); }
 		/** Where the garment covers the torso: its torso and shoulder colliders grown by Room(). */
@@ -53,9 +65,9 @@ namespace ReflectAR
 		{
 			FRestSkeleton Skel;
 			TSharedPtr<FGarmentMeshData> Data;
-			TArray<float> MaxDist, SkinK, ERest, BRest;
+			TArray<float> MaxDist, SkinK, ERest, BRest, EdgeDist, InvDeg;
 			TArray<int32> EA, EB, BA, BB;
-			float Ms = 0;
+			float Ms = 0, MeanEdge = 0.02f;
 		};
 		static TSharedPtr<FBuilt> Generate(FRestSkeleton Skel, const FGarmentSpec* Spec);
 		void ApplyPending(double Now);
@@ -78,11 +90,24 @@ namespace ReflectAR
 		TArray<int32> EA, EB, BA, BB;
 		FFrame RestFrames[6];
 		FAffine SkinM[6];
-		TArray<FCapsuleB> Colliders;
+		TArray<FCapsuleB> Colliders;      // shoulders, arms, neck
+		TArray<FCapsuleB> TorsoCaps;      // coarse torso outline, for Outline() only
 		TArray<V3> ColCenter;
 		TArray<float> ColBound;
+		// the torso as stacked elliptical sections, for collisions
+		static constexpr int NumSections = 24;
+		struct FSection { V3 R, F; float a = 0, d = 0; };
+		FSection Sections[NumSections];
+		float SecT0 = 0, SecT1 = 1;
 
 		// render mesh (split at UV seams)
-		TArray<V3> SimN, TAcc, BAcc;
+		TArray<V3> SimN, TAcc, BAcc, Lap;
+		TArray<float> EdgeDist, InvDeg, Ao;      // per simulated vertex: 0..1 over EdgeBand from an edge; 1 / neighbours; shading
+		float MeanEdge = 0.02f;
+		void Shade();
+
+	public:
+		/** Width of the band along every edge of the garment that EdgeDist (vertex colour G) spans, m. */
+		static constexpr float EdgeBand = 0.06f;
 	};
 }

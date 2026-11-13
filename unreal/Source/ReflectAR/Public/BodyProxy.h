@@ -70,5 +70,7 @@ namespace ReflectAR
 		void HideExposed(int i) { Parts[i].Scale = Parts[Core(i)].Scale = V3::ZeroVector; }
 		void Props(int i, bool bTrim, float Push, const V3& Offset) { Parts[i].bTrim = bTrim; Parts[i].Push = Push; Parts[i].Offset = Offset; }
 		void Emit();
+		bool EmitTorso(int Base, float U);
+		const FClothGarment* TorsoOf = nullptr;      // whose body sections shape the torso (this frame only)
 	};
 }

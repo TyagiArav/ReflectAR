@@ -38,9 +38,10 @@ namespace ReflectAR
 		float Stretch = 1e-6f;            // stretch compliance (lower = less stretchy)
 		float Compress = 2e-4f;           // compression compliance (higher = buckles easily)
 		float Bend = 2e-2f;               // bending compliance (higher = softer, drapier)
-		float Damping = 0.04f;
+		float Damping = 0.08f;
 		float Drape = 1.f;                // how far loose regions may hang from the body
-		float Sheen = 0.25f;              // cloth shading model: fuzz / sheen amount
+		float Sheen = 0.25f;              // brightness of the fuzz at grazing angles
+		float Cloth = 1.f;                // 1 = matte fibre response (cotton, wool, denim), lower = smoother shell fabrics (nylon)
 		float Density = 1.f;              // relative weight (gravity sag)
 
 		// ---- fit: how the cut follows the measured body (GarmentMesher)
@@ -51,6 +52,8 @@ namespace ReflectAR
 		// ---- material and trims
 		float Smooth = 0.22f;             // perceptual smoothness of the fibres (roughness = 1 - this)
 		float Bump = 1.f;                 // weave normal-map strength
+		float Fold = 1.f;                 // soft drape folds and creases in the shading (stiff fabrics: less)
+		float Heather = 0.1f;             // fibre-to-fibre colour variation (heather grey: high)
 		FLinearColor Trim = FLinearColor(0.92f, 0.9f, 0.85f);    // buttons, or the zipper tape
 		FLinearColor Metal = FLinearColor(0.74f, 0.74f, 0.76f);  // zipper teeth / slider, metal buttons
 		bool bMetalButtons = false;
@@ -59,8 +62,26 @@ namespace ReflectAR
 	/** The 10 upper-body garments in the catalogue. */
 	const TArray<FGarmentSpec>& GarmentCatalog();
 
-	/** Colour and weave height (0..1) at (u, v) in [0, 1) of one repeat of the pattern. */
+	/** Colour and weave height (0..1) at (u, v) in [0, 1) of one repeat of the pattern. Tiles exactly. */
 	void SamplePattern(const FGarmentSpec& S, float u, float v, FLinearColor& OutColor, float& OutHeight);
+
+	/** Noise in [0, 1] that repeats every Period cells in x and y (smooth value noise). */
+	float TileNoise(float x, float y, int Period, int Seed = 0);
+
+	/**
+	 * Pixels of the material maps for one repeat of a fabric, N x N, row-major: base colour (linear
+	 * values, stored as sRGB), tangent-space normal from the weave height, and a mask (G = ambient
+	 * occlusion in the weave's valleys, A = smoothness). Pure: no engine objects.
+	 */
+	void BuildFabricPixels(const FGarmentSpec& S, int N, TArray<FLinearColor>& Col, TArray<FLinearColor>& Nrm, TArray<FLinearColor>& Msk);
+
+	/**
+	 * Pixels of the drape map shared by all garments, one repeat of FoldTileM metres: RG = normal of
+	 * soft folds a few centimetres wide, B = their height (0.5 = flat), A = slow variation of the
+	 * dye and wear, used to keep the fabric's colour from being perfectly flat.
+	 */
+	constexpr float FoldTileM = 0.64f;
+	void BuildFoldPixels(int N, TArray<FLinearColor>& Out);
 
 	/**
 	 * Material maps for one repeat of a fabric: base colour (sRGB), tangent-space normal map from
@@ -71,5 +92,7 @@ namespace ReflectAR
 	{
 		TStrongObjectPtr<UTexture2D> BaseColor, Normal, Mask;
 		static const FFabricMaps& Get(const FGarmentSpec& S);
+		/** The drape map (BuildFoldPixels), shared by all garments. */
+		static UTexture2D* Fold();
 	};
 }

@@ -5,6 +5,9 @@ namespace ReflectAR
 {
 	// extra radius of exposed parts (m, for a 0.36 m shoulder span); the mask trims it back
 	static constexpr float ArmMargin = 0.03f, HandMargin = 0.035f, HeadMargin = 0.05f;
+	// parts under the garment are drawn this much smaller than the body the cloth collides with
+	static constexpr float Under = 0.009f;
+	static constexpr int CapSeg = 16, CapRings = 5;      // unit capsule / sphere tessellation
 
 	struct FLegSeg { int a, b; float r; };
 	static const FLegSeg LegSegs[4] =
@@ -15,7 +18,7 @@ namespace ReflectAR
 	/** Unit capsule like Unity's primitive: radius 0.5, 2 tall along Y. Or a sphere of radius 0.5. */
 	static void UnitShape(bool bSphere, TArray<V3>& V, TArray<V3>& N, TArray<int32>& T)
 	{
-		constexpr int Seg = 16, Rings = 5;                   // rings per hemisphere
+		constexpr int Seg = CapSeg, Rings = CapRings;        // rings per hemisphere
 		// latitude rows from the top pole to the bottom pole; a capsule splits at the equator
 		TArray<float> Lat, Off;
 		for (int i = 0; i <= Rings; i++) { Lat.Add(HALF_PI * (1.f - i / float(Rings))); Off.Add(bSphere ? 0.f : 0.5f); }
@@ -89,11 +92,20 @@ namespace ReflectAR
 		if (Garment) Garment->Outline(Cover);
 		const float Room = Garment ? Garment->Room() : 0.f;
 
-		// ---- under the garment: fitted, never trimmed
-		Place(Parts[Torso], B.HipC, B.ShC, B.ShoulderW * 0.42f, 0.095f * u, B.Fwd);
+		// ---- under the garment: inside the body the cloth collides with, never trimmed
+		Place(Parts[Torso], B.HipC, B.ShC, B.ShoulderW * 0.4f, 0.07f * u, B.Fwd);      // reshaped in Emit() once the garment exists
+		TorsoOf = Garment;
 		Place(Parts[Neck], B.ShC, B.HeadC - B.Up * 0.05f * u, 0.05f * u, 0.05f * u, B.Fwd);
+		// thighs start below the hem: at the hip they are wider than the torso the garment was cut
+		// for, and would show through its sides (the torso part covers the gap)
+		const float Drop = Garment ? FMath::Max(-Garment->Spec.Hem, 0.f) * B.TorsoLen : 0.f;
 		for (int i = 0; i < 4; i++)
-			Place(Parts[Legs + i], J[LegSegs[i].a], J[LegSegs[i].b], LegSegs[i].r * u, LegSegs[i].r * u, B.Fwd);
+		{
+			const V3 A = J[LegSegs[i].a], Bt = J[LegSegs[i].b];
+			const float r = LegSegs[i].r * u, Len = V3::Distance(A, Bt);
+			const float Skip = i < 2 && Garment ? FMath::Min((Drop + r + 0.015f * u) / FMath::Max(Len, 1e-3f), 0.9f) : 0.f;
+			Place(Parts[Legs + i], LerpU(A, Bt, Skip), Bt, r, r, B.Fwd);
+		}
 
 		for (int s = 0; s < 2; s++)
 		{
@@ -103,14 +115,16 @@ namespace ReflectAR
 			const V3 S = J[Si], E = J[Ei], W = J[Wi];
 			const float L1 = V3::Distance(S, E), L2 = V3::Distance(E, W);
 			const float RUpper = 0.045f * u, RFore = 0.04f * u, m = ArmMargin * g;
+			// under a sleeve: well inside the arm the cloth collides with, so it can't show through
+			const float RUpperIn = (FClothGarment::UpperArmR - Under) * u, RForeIn = (FClothGarment::ForearmR - Under) * u;
 
 			// arm: covered from the shoulder to the cuff, bare (oversized + trimmed) after it
 			const float Cuff = Clamp01(Sleeve) * (L1 + L2);
 			const float Bare = Cuff + (Cuff > 0.f ? 0.02f * u + RFore + m : 0.06f * u);   // clear of the cuff / armhole
 			auto P = [&](float x) { return x <= L1 ? LerpV(S, E, x / FMath::Max(L1, 1e-4f)) : LerpV(E, W, (x - L1) / FMath::Max(L2, 1e-4f)); };
 
-			if (Cuff > 0.f) Place(Parts[Covered + 2 * s], S, P(FMath::Min(Cuff, L1)), RUpper, RUpper, B.Fwd); else Parts[Covered + 2 * s].Scale = V3::ZeroVector;
-			if (Cuff > L1) Place(Parts[Covered + 2 * s + 1], E, P(Cuff), RFore, RFore, B.Fwd); else Parts[Covered + 2 * s + 1].Scale = V3::ZeroVector;
+			if (Cuff > 0.f) Place(Parts[Covered + 2 * s], S, P(FMath::Min(Cuff, L1)), RUpperIn, RUpperIn, B.Fwd); else Parts[Covered + 2 * s].Scale = V3::ZeroVector;
+			if (Cuff > L1) Place(Parts[Covered + 2 * s + 1], E, P(Cuff), RForeIn, RForeIn, B.Fwd); else Parts[Covered + 2 * s + 1].Scale = V3::ZeroVector;
 			if (Cuff > 0.f) Cover.Emplace(S, P(FMath::Min(Cuff, L1)), RUpper + Room);      // the sleeve
 			if (Cuff > L1) Cover.Emplace(E, P(Cuff), RFore + Room);
 
@@ -158,12 +172,43 @@ namespace ReflectAR
 		Emit();
 	}
 
+	/**
+	 * The torso under the garment: the capsule's rows of vertices laid on the body's elliptical
+	 * sections from the shoulders down past the hem, a little inside them.
+	 */
+	bool FBodyProxy::EmitTorso(int Base, float U)
+	{
+		V3 C, R, F; float a, d;
+		if (!TorsoOf || !TorsoOf->TorsoSection(0.5f, C, R, F, a, d)) return false;
+		constexpr int Rows = 2 * (CapRings + 1), PerRow = CapSeg + 1;
+		const float T1 = 0.99f, T0 = TorsoOf->BodyBottom(), In = Under * U;
+		for (int r = 0; r < Rows; r++)
+		{
+			TorsoOf->TorsoSection(FMath::Lerp(T1, T0, r / float(Rows - 1)), C, R, F, a, d);
+			const V3 Up = Cross(F, R);
+			const bool bPole = r == 0 || r == Rows - 1;
+			const float Rf = bPole ? 0.f : (r == 1 || r == Rows - 2 ? 0.75f : 1.f);
+			const float Ra = FMath::Max(a - In, 0.01f) * Rf, Rd = FMath::Max(d - In, 0.01f) * Rf;
+			for (int k = 0; k < PerRow; k++)
+			{
+				const float Lon = 2.f * PI * k / CapSeg, cl = FMath::Cos(Lon), sl = FMath::Sin(Lon);
+				const int Vi = Base + r * PerRow + k;
+				Mesh.Pos[Vi] = C + R * (Ra * cl) + F * (Rd * sl);
+				Mesh.Nrm[Vi] = bPole ? Up * (r == 0 ? 1.f : -1.f) : Normalized(R * (cl * d) + F * (sl * a));
+				Mesh.Tan[Vi] = V4(R.X, R.Y, R.Z, 1.f);
+				UV1[Vi] = V2::ZeroVector; UV2[Vi] = V2::ZeroVector; UV3[Vi] = V2::ZeroVector;
+			}
+		}
+		return true;
+	}
+
 	void FBodyProxy::Emit()
 	{
 		int Base = 0;
 		for (int i = 0; i < Total; i++)
 		{
 			const FPart& P = Parts[i];
+			if (i == Torso && !P.Scale.IsNearlyZero() && EmitTorso(Base, FMath::Max(P.Scale.X, 0.f) / (0.8f * 0.36f))) { Base += CapsuleV.Num(); continue; }
 			const TArray<V3>& Vs = P.bSphere ? SphereV : CapsuleV;
 			const TArray<V3>& Ns = P.bSphere ? SphereN : CapsuleN;
 			const bool bHidden = P.Scale.IsNearlyZero();

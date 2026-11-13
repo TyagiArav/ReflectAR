@@ -8,12 +8,17 @@ Parameter names must match Source/ReflectAR (ReflectARMirror.cpp):
                    CamBody (viewpoint, body coords), CoverA0..11 / CoverB0..11 (garment outline
                    capsules: ends, A.w = radius), Flags (x feed brightness, y mask threshold,
                    z cover count, w proxy debug view), Ambient (rgb, luminance of white)
-  M_Fabric(Fade)   BaseColorMap, NormalMap, MaskMap, Tile, Tint, Metallic, Sheen (+ Alpha)
+  M_Fabric(Fade)   BaseColorMap, NormalMap, MaskMap, Tile, Tint, Metallic, Sheen, Cloth,
+                   FoldMap (RG fold normal, A dye variation), FoldTile, Fold (+ Alpha);
+                   vertex colour R = ambient occlusion, G = distance from the garment's edge / 6 cm
   M_Trim(Fade)     Tint, Metallic, Roughness (+ Alpha)
   M_Proxy          MaskTex, FeedTex; per vertex UV1 = mask-motion xy, UV2 = (motion z, push m), UV3.x = trim
   M_Feed           FeedTex, Dim
 """
 import unreal
+
+# Bump when the materials change: init_unreal.py rebuilds them when this differs from the last build.
+VERSION = "2"
 
 DIR = "/Game/ReflectAR"
 DEFAULT_TEX = "/Engine/EngineResources/DefaultTexture.DefaultTexture"
@@ -115,9 +120,19 @@ def build_collection():
 
 # ---------------------------------------------------------------------------- garments
 NORMAL_CODE = """float3 n = N * 2 - 1;
+// soft drape folds (centimetres wide) under the weave
+n = normalize(float3(n.xy + (F.xy * 2 - 1) * Amt, n.z));
 // Cancel the two-sided back-face flip: the garment is lit by its outward normal on both sides, so
 // shading doesn't depend on triangle winding (the CameraFeed view is mirrored).
 return float3(n.xy, n.z * Sign);"""
+
+# Base colour: what a flat texture leaves out.
+SHADE_CODE = """float3 c = Base * (0.86 + 0.28 * Dye);                 // dye and wear are never perfectly even
+float e = VC.g * 0.06;                                   // metres from the nearest hem, cuff or neckline
+c *= 1 - 0.16 * saturate(1 - abs(e - 0.016) / 0.0022);   // the line of stitching that holds the hem
+c *= lerp(1, VC.r, 0.6);                                 // creases, under the arms
+float inside = saturate(0.5 - 6 * dot(normalize(Nv), normalize(Cv)));
+return c * lerp(1, 0.5, inside);                         // looking into a sleeve or under the hem"""
 
 
 def build_fabric(mpc, fade):
@@ -128,30 +143,44 @@ def build_fabric(mpc, fade):
     if fade:
         m.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
         m.set_editor_property("translucency_lighting_mode", unreal.TranslucencyLightingMode.TLM_SURFACE_PER_PIXEL_LIGHTING)
-    uv0 = node(m, unreal.MaterialExpressionTextureCoordinate, -1400, 0)
-    uv = mul(m, uv0, scalar(m, "Tile", 4.0, -1400, 150), -1200, 0)
-    base = texture(m, "BaseColorMap", uv, -1000, -300)
-    nrm = texture(m, "NormalMap", uv, -1000, 0)
-    msk = texture(m, "MaskMap", uv, -1000, 300)
-    col = mul(m, base, vector(m, "Tint", unreal.LinearColor(1, 1, 1, 1), -1000, -500), -700, -300, a_out="RGB")
+    uv0 = node(m, unreal.MaterialExpressionTextureCoordinate, -1700, 0)
+    uv = mul(m, uv0, scalar(m, "Tile", 4.0, -1700, 150), -1500, 0)
+    base = texture(m, "BaseColorMap", uv, -1300, -300)
+    nrm = texture(m, "NormalMap", uv, -1300, 0)
+    msk = texture(m, "MaskMap", uv, -1300, 300)
+    fold = texture(m, "FoldMap", mul(m, uv0, scalar(m, "FoldTile", 1.5625, -1700, 750), -1500, 650), -1300, 650)
+    vc = node(m, unreal.MaterialExpressionVertexColor, -1300, 950)
+    tinted = mul(m, base, vector(m, "Tint", unreal.LinearColor(1, 1, 1, 1), -1300, -500), -1000, -300, a_out="RGB")
+    col = custom(m, -700, -300, SHADE_CODE, ["Base", "Dye", "VC", "Nv", "Cv"], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    link(tinted, "", col, "Base")
+    link(fold, "A", col, "Dye")
+    link(vc, "", col, "VC")                         # R = ambient occlusion, G = edge distance (white without colours)
+    link(node(m, unreal.MaterialExpressionVertexNormalWS, -1000, -150), "", col, "Nv")
+    link(node(m, unreal.MaterialExpressionCameraVectorWS, -1000, -50), "", col, "Cv")
     mel.connect_material_property(col, "", P.MP_BASE_COLOR)
-    n = custom(m, -700, 0, NORMAL_CODE, ["N", "Sign"], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    n = custom(m, -700, 0, NORMAL_CODE, ["N", "Sign", "F", "Amt"], unreal.CustomMaterialOutputType.CMOT_FLOAT3)
     link(nrm, "RGB", n, "N")
     link(node(m, unreal.MaterialExpressionTwoSidedSign, -1000, 150), "", n, "Sign")
+    link(fold, "RGB", n, "F")
+    link(scalar(m, "Fold", 1.0, -1000, 250), "", n, "Amt")
     mel.connect_material_property(n, "", P.MP_NORMAL)
     rough = node(m, unreal.MaterialExpressionOneMinus, -700, 300)
     link(msk, "A", rough, "")
     mel.connect_material_property(rough, "", P.MP_ROUGHNESS)
-    mel.connect_material_property(msk, "G", P.MP_AMBIENT_OCCLUSION)
-    mel.connect_material_property(scalar(m, "Metallic", 0.0, -700, 450), "", P.MP_METALLIC)
-    # cloth: fuzz colour = a lighter version of the base, amount = Sheen
-    sheen = scalar(m, "Sheen", 0.25, -700, 600)
-    lighter = node(m, unreal.MaterialExpressionLinearInterpolate, -450, 500, const_b=1.0, const_alpha=0.4)
+    ao = custom(m, -700, 400, "return Weave * VC.r;", ["Weave", "VC"], unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+    link(msk, "G", ao, "Weave")
+    link(vc, "", ao, "VC")
+    mel.connect_material_property(ao, "", P.MP_AMBIENT_OCCLUSION)
+    mel.connect_material_property(scalar(m, "Metallic", 0.0, -700, 500), "", P.MP_METALLIC)
+    # cloth: fuzz colour = a lighter version of the base, its brightness = Sheen; Cloth = how much
+    # of the response is fibre-like (cotton, wool: all of it) rather than a smooth shell (nylon)
+    sheen = scalar(m, "Sheen", 0.25, -700, 650)
+    lighter = node(m, unreal.MaterialExpressionLinearInterpolate, -450, 550, const_b=1.0, const_alpha=0.4)
     link(col, "", lighter, "A")
-    mel.connect_material_property(mul(m, lighter, sheen, -250, 500), "", P.MP_SUBSURFACE_COLOR)
-    mel.connect_material_property(sheen, "", P.MP_CUSTOM_DATA0)
+    mel.connect_material_property(mul(m, lighter, sheen, -250, 550), "", P.MP_SUBSURFACE_COLOR)
+    mel.connect_material_property(scalar(m, "Cloth", 1.0, -700, 750), "", P.MP_CUSTOM_DATA0)
     # the room's bounce light (there is no environment to light the cloth indirectly)
-    amb = mul(m, mul(m, col, msk, -450, 200, b_out="G"), collection(m, mpc, "Ambient", -700, 750), -250, 200)
+    amb = mul(m, mul(m, col, msk, -450, 200, b_out="G"), collection(m, mpc, "Ambient", -700, 850), -250, 200)
     mel.connect_material_property(amb, "", P.MP_EMISSIVE_COLOR)
     if fade:
         mel.connect_material_property(scalar(m, "Alpha", 1.0, -250, 750), "", P.MP_OPACITY)
@@ -294,7 +323,22 @@ def build():
     build_trim(mpc, True)
     build_proxy(mpc)
     build_feed()
-    unreal.log("ReflectAR setup: materials written to " + DIR)
+    with open(version_file(), "w") as f:
+        f.write(VERSION)
+    unreal.log("ReflectAR setup: materials (version %s) written to %s" % (VERSION, DIR))
+
+
+def version_file():
+    return unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()) + "ReflectAR/materials.version"
+
+
+def is_current():
+    """True if the materials on disk were built by this version of the script."""
+    try:
+        with open(version_file()) as f:
+            return f.read().strip() == VERSION
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":

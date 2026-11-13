@@ -159,6 +159,10 @@ void AReflectARMirror::CreateGarments()
 			Set[0]->SetTextureParameterValue(TEXT("MaskMap"), Maps.Mask.Get());
 			Set[0]->SetScalarParameterValue(TEXT("Tile"), 1.f / FMath::Max(Sp.Tile, 0.01f));   // UVs are metres of fabric
 			Set[0]->SetScalarParameterValue(TEXT("Sheen"), Sp.Sheen);
+			Set[0]->SetScalarParameterValue(TEXT("Cloth"), Sp.Cloth);
+			Set[0]->SetTextureParameterValue(TEXT("FoldMap"), FFabricMaps::Fold());
+			Set[0]->SetScalarParameterValue(TEXT("FoldTile"), 1.f / FoldTileM);
+			Set[0]->SetScalarParameterValue(TEXT("Fold"), Sp.Fold);
 			for (int k = 1; k < 3; k++)
 			{
 				Set[k] = UMaterialInstanceDynamic::Create(f == 0 ? Trim : TrimFade, this);
@@ -187,6 +191,7 @@ void AReflectARMirror::HandleInput()
 		if (Pressed(EKeys::C)) bCubeTest = !bCubeTest;
 		if (Pressed(EKeys::P)) { bPredict = !bPredict; Toast(bPredict ? TEXT("Prediction on") : TEXT("Prediction off")); }
 		if (Pressed(EKeys::O)) { bTrimToMask = !bTrimToMask; Toast(bTrimToMask ? TEXT("Occlusion: person mask") : TEXT("Occlusion: capsules only")); }
+		if (Pressed(EKeys::K)) { Rig.bStabilise = !Rig.bStabilise; Toast(Rig.bStabilise ? TEXT("Skeleton stabilisation on") : TEXT("Skeleton stabilisation off")); }
 		if (Pressed(EKeys::LeftBracket)) LeadMs -= 5.f;
 		if (Pressed(EKeys::RightBracket)) LeadMs += 5.f;
 		if (Pressed(EKeys::Escape)) UKismetSystemLibrary::QuitGame(this, PC, EQuitPreference::Quit, false);
@@ -237,8 +242,11 @@ static void Upload(UProceduralMeshComponent* C, int Index, const FMeshSection& S
 {
 	TArray<FVector> V, N; TArray<FVector2D> UV; TArray<FProcMeshTangent> T;
 	ToUE(S, V, N, UV, T);
-	if (bCreate) C->CreateMeshSection(Index, V, S.Tris, N, UV, TArray<FColor>(), T, false);
-	else C->UpdateMeshSection(Index, V, N, UV, TArray<FColor>(), T);
+	// vertex colours carry the cloth's shading data (FMeshSection::Col); sections without any read as white
+	static const TArray<FColor> NoColors;
+	const TArray<FColor>& Col = S.Col.Num() == S.Pos.Num() ? S.Col : NoColors;
+	if (bCreate) C->CreateMeshSection(Index, V, S.Tris, N, UV, Col, T, false);
+	else C->UpdateMeshSection(Index, V, N, UV, Col, T);
 }
 
 void AReflectARMirror::UploadGarment(FGarmentSlot& G)
@@ -337,6 +345,7 @@ void AReflectARMirror::Tick(float Dt)
 		const double Target = bMatchFeed ? Tracking->FeedCaptureTime : NowT + Tracking->DisplayLatency() + LeadMs * 0.001;
 		Tracking->Predict(Target, bPredict, bPredict && !bMatchFeed);
 		if (!bHadBody) Shape.Reset(Rig);                  // a new person: measure them from scratch
+		if (F->Cam.Valid()) Rig.CamPos = CamPosBody(F->Cam);     // depth is stabilised along the camera's lines of sight
 		Rig.Update(Tracking->Joints, Tracking->Visibility, Dt, !bHadBody || NowT - LastTracked > 0.5);
 		bHadBody = true;
 		LastTracked = NowT;
